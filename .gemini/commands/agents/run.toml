@@ -20,7 +20,7 @@ The `run_shell_command` tool will return the PID of the background process. You 
 echo '{"taskId": "task_123", "status": "running", "agent": "coder-agent", ...}' > .gemini/agents/tasks/task_123.json
 
 # Step 2: Execute the agent in the background. The tool will return the PID.
-gemini -e coder-agent -y -p "You are the coder-agent. Your Task ID is task_123. Your task is to: Write a function. Follow your persona's instructions and create the .done file when finished." >> .gemini/agents/logs/task_123.log 2>&1 &
+gemini -m flash -e coder-agent -y -p "You are the coder-agent. Your Task ID is task_123. Your task is to: Write a function. Follow your persona's instructions and create the .done file when finished." >> .gemini/agents/logs/task_123.log 2>&1 &
 
 # Step 3: Capture PID from the previous step's tool output and update the task file again.
 # Replace <PID_FROM_TOOL_OUTPUT> with the actual PID.

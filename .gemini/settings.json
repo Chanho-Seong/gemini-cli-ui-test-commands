@@ -1,8 +1,13 @@
 {
   "theme": "Shades Of Purple",
   "mcpServers": {
-    "context7": {
-      "httpUrl": "https://mcp.context7.com/mcp"
+    "context7-mcp": {
+      "url": "https://server.smithery.ai/upstash/context7-mcp/mcp",
+      "type": "http"
+    },
+    "mobile-mcp": {
+      "command": "npx",
+      "args": ["-y", "@mobilenext/mobile-mcp@latest"]
     }
   }
 }

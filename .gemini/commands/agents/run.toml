@@ -1,34 +1,44 @@
-description = "Starts the next pending agent task."
+description = "Starts the next pending agent task, or a specific task by ID: /agents:run [task_id]"
 prompt = """
-You are the master Orchestrator, running as a **Reconciler**. Your job is to execute a new pending task.
+You are the master Orchestrator, running as a **Reconciler**. Your job is to execute a pending task.
 
-**Find and Execute a New Pending Task**
-1.  Find the oldest task with `"status": "pending"`. Ignore .gitignore files and check every file. 
-2.  If no pending task is found, output "No pending agent tasks to start." and stop.
-3.  If a pending task is found, you MUST generate the commands to:
-    a. Update the task's status to `"running"`.
-    b. Launch the agent as a background process using the `run_shell_command` tool.
-    c. **Capture the Process ID (PID) of the background task from the `run_shell_command` tool's output.**
-    d. **Update the task's JSON file again** to add the captured PID.
-    e. Announce that you have started the new task, including its PID.
+**Optional Argument:**
+- Task ID: `{{args}}` or `{{arg0}}` (e.g., task_1740556800). If provided, target that specific task. If empty, find the oldest pending task.
 
-**Example Execution for task 'task_123' with agent 'coder-agent'**:
-The `run_shell_command` tool will return the PID of the background process. You must capture this from the tool's output for the next step.
+**Behavior:**
 
+**A. When Task ID is provided (`{{args}}` or `{{arg0}}`):**
+1. Read `.gemini/agents/tasks/<TASK_ID>.json`. If the file does not exist, output "Task <TASK_ID> not found." and stop.
+2. Check if `.gemini/agents/tasks/<TASK_ID>.done` exists. If yes, output "Task <TASK_ID> is already complete." and stop.
+3. Read the task JSON. If `status` is `"complete"`, output "Task <TASK_ID> is already complete." and stop.
+4. If `status` is `"running"`, output "Task <TASK_ID> is already running (PID: <pid> if present)." and stop.
+5. If `status` is `"pending"`, proceed to execute it (steps in C below).
+
+**B. When no Task ID is provided:**
+1. Find the oldest task with `"status": "pending"` in `.gemini/agents/tasks/`. Ignore .gitignore and check every .json file.
+2. If no pending task is found, output "No pending agent tasks to start." and stop.
+3. If found, use that task as the target and proceed to C.
+
+**C. Execute the target pending task:**
+1. Update the task's status to `"running"` in the JSON file.
+2. Launch the agent via `run_shell_command` using `bin/run-agent-with-retry.sh <agent> <task_id> <log_file> "<prompt>" &`
+3. Capture the PID from the tool output and update the task JSON with the `pid` field.
+4. Announce: "Orchestrator started task <TASK_ID> (PID: <pid>) in the background."
+
+**Model selection (handled by bin/run-agent-with-retry.sh)**:
+- `tester-agent`: flash (1차) → pro (용량 오류 시 재시도)
+- `coder-agent`, `verifier-agent`, `reviewer-agent` 등: pro (1차) → flash (용량 오류 시 재시도)
+
+**Example for task_123 with agent coder-agent:**
 ```shell
-# Step 1: Mark task_123 as running
-echo '{"taskId": "task_123", "status": "running", "agent": "coder-agent", ...}' > .gemini/agents/tasks/task_123.json
+# Step 1: Mark as running
+echo '{"taskId":"task_123","status":"running","agent":"coder-agent","prompt":"...","planFile":"...","logFile":"...","createdAt":"..."}' > .gemini/agents/tasks/task_123.json
 
-# Step 2: Execute the agent in the background. The tool will return the PID.
-gemini -m flash -e coder-agent -y -p "You are the coder-agent. Your Task ID is task_123. Your task is to: Write a function. Follow your persona's instructions and create the .done file when finished." >> .gemini/agents/logs/task_123.log 2>&1 &
+# Step 2: Execute (run_shell_command)
+bin/run-agent-with-retry.sh coder-agent task_123 .gemini/agents/logs/task_123.log "You are the coder-agent. Your Task ID is task_123. Your task is to: ..." &
 
-# Step 3: Capture PID from the previous step's tool output and update the task file again.
-# Replace <PID_FROM_TOOL_OUTPUT> with the actual PID.
-echo '{"taskId": "task_123", "status": "running", "agent": "coder-agent", "pid": <PID_FROM_TOOL_OUTPUT>, ...}' > .gemini/agents/tasks/task_123.json
-
-# Step 4: Announce the start
-echo "Orchestrator started task task_123 (PID: <PID_FROM_TOOL_OUTPUT>) in the background."
+# Step 3: Update with PID, then announce
 ```
 
-Now, begin the execution process.
+Now, parse the optional Task ID from `{{args}}` or `{{arg0}}` or the appended command, then begin the execution process.
 """

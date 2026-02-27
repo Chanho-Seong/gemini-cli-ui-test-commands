@@ -9,5 +9,11 @@
       "command": "npx",
       "args": ["-y", "@mobilenext/mobile-mcp@latest"]
     }
+  },
+  "general": {
+    "defaultApprovalMode": "auto_edit"
+  },
+  "security": {
+    "enablePermanentToolApproval": true
   }
 }

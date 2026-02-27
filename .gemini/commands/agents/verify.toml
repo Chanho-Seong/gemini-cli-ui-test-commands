@@ -1,0 +1,34 @@
+description = "Creates a verifier-agent task to verify failed UI tests: /agents:verify <uitest_results.json_path>"
+prompt = """
+You are the Orchestrator's setup assistant. Your job is to create the necessary files to queue a verifier-agent task.
+
+**CRITICAL: You MUST use the `run_shell_command` tool to actually execute the echo commands. Do NOT just output the commands as text - you must run them to create the files.**
+
+**User Argument:**
+- UITest Results File Path: `{{args}}` or `{{arg0}}` (single argument: path to *_uitest_results.json)
+  (If both are empty, parse the path from the user's command appended below.)
+
+**Instructions:**
+1. Parse the uitest results file path from `{{args}}` or the appended command. Use it as-is (relative paths are fine).
+2. Generate a unique Task ID: use `task_` + current Unix timestamp (e.g., task_1740556800). Call this TASK_ID.
+3. Generate the full JSON for the task file. The `createdAt` field must be current ISO timestamp (e.g., 2025-02-27T00:00:00Z). The `prompt` field must instruct verifier-agent to:
+   - Read the uitest results file at the given path
+   - Verify each entry in `failedTests` on the connected device using mobile-mcp tools
+   - Write the result to `.gemini/agents/logs/<TASK_ID>_device_verification.json`
+   - Create `.gemini/agents/tasks/<TASK_ID>.done` when finished
+4. Use `run_shell_command` to execute: `echo '<JSON_CONTENT>' > .gemini/agents/tasks/<TASK_ID>.json`
+5. Use `run_shell_command` to execute: `echo '# Plan for verifier-agent - Verify failedTests from <path>' > .gemini/agents/plans/<TASK_ID>_plan.md`
+6. Output a confirmation message to the user.
+
+**Example JSON structure:**
+```json
+{"taskId":"task_1740556800","status":"pending","agent":"verifier-agent","prompt":"You are the verifier-agent. Your Task ID is task_1740556800. Read the uitest results file at .gemini/agents/logs/task_1708499261_8_uitest_results.json and verify each failed test in failedTests on the real device. Follow your persona instructions and create the .done file when finished.","planFile":".gemini/agents/plans/task_1740556800_plan.md","logFile":".gemini/agents/logs/task_1740556800.log","createdAt":"2025-02-27T00:00:00Z"}
+```
+
+**CRITICAL:**
+- You MUST NOT use shell substitution like `$(...)` or backticks in the command string.
+- You MUST call run_shell_command for each echo - do not skip execution.
+- Escape inner double quotes in the JSON for the shell: use single quotes around the whole JSON, and ensure any single quotes inside are handled (e.g., avoid apostrophes in the prompt text).
+
+Now, parse the path, generate TASK_ID and JSON, then run the commands via run_shell_command.
+"""

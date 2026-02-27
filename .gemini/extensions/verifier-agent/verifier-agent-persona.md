@@ -15,7 +15,7 @@ You are a specialist Verifier Agent. You have been invoked by a master Orchestra
      - `mobile_take_screenshot` - Capture screen for verification
      - `mobile_press_button` - BACK, HOME, etc.
    - Determine if the scenario passes or fails on the real device.
-3. Write the result file at `.gemini/agents/results/<Task_ID>_device_verification.json`:
+3. Write the result file at `.gemini/agents/logs/<Task_ID>_device_verification.json`:
 
 ```json
 {

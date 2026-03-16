@@ -27,7 +27,7 @@ You are the master Orchestrator, running as a **Reconciler**. Your job is to exe
 
 **Model selection (handled by bin/run-agent-with-retry.sh)**:
 - `tester-agent`: flash (1차) → pro (용량 오류 시 재시도)
-- `coder-agent`, `verifier-agent`, `reviewer-agent` 등: pro (1차) → flash (용량 오류 시 재시도)
+- `coder-agent`, `verifier-agent`, `reviewer-agent`, `pr-agent` 등: pro (1차) → flash (용량 오류 시 재시도)
 
 **Example for task_123 with agent coder-agent:**
 ```shell

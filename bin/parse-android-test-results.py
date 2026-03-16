@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import List, Tuple
 
 
+def sanitize_for_json(s: str) -> str:
+    """Replace control characters that could cause JSON issues. json.dumps escapes \\n \\t \\r etc., but raw control chars (e.g. from XML) may cause problems."""
+    if not s:
+        return s
+    return "".join(c if ord(c) >= 32 or c in "\n\r\t" else " " for c in s)
+
+
 def derive_test_file_path(className: str, module_name: str) -> str:
     """Convert fully qualified class name to test file path relative to project root."""
     if "." not in className:
@@ -72,10 +79,10 @@ def parse_xml_file(xml_path: Path) -> Tuple[List[dict], int, int]:
                 stack_trace = error_message
 
             failed_tests.append({
-                "className": classname,
-                "testName": testname,
-                "errorMessage": error_message,
-                "stackTrace": stack_trace,
+                "className": sanitize_for_json(classname),
+                "testName": sanitize_for_json(testname),
+                "errorMessage": sanitize_for_json(error_message),
+                "stackTrace": sanitize_for_json(stack_trace),
             })
 
     return failed_tests, total, passed

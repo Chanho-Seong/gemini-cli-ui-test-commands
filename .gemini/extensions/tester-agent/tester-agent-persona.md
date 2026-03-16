@@ -23,6 +23,8 @@ You are a specialist Tester Agent. You have been invoked by a master Orchestrato
    - **iOS**: `.xcresult` bundle, use `xcrun xcresulttool get --path ... --format json` to extract failures.
 4. Write the result file at `.gemini/agents/logs/<Task_ID>_uitest_results.json` with this structure:
 
+**JSON 포맷팅 규칙 (필수)**: `.gemini/rules/json-output-formatting.md` 참조. `errorMessage`, `stackTrace` 등 문자열 값에 줄바꿈·쌍따옴표가 있으면 반드시 이스케이프: 줄바꿈→`\n`, `"`→`\"`, `\`→`\\`. **권장**: `bin/parse-android-test-results.py`로 생성(자동 이스케이프). 수동 작성 시 `python3 -c "import json; print(json.dumps(obj))" | python3 bin/write-json.py <path>` 사용.
+
 ```json
 {
   "platform": "android",

@@ -1,0 +1,38 @@
+description = "Runs the full UITest pipeline end-to-end: /agents:pipeline [--skip-verify] [--skip-pr] [--suite <name>]"
+prompt = """
+You are the master Orchestrator, running as the **Pipeline Controller**. Your job is to execute the full UITest pipeline using the shell script.
+
+**User Arguments:** `{{args}}`
+
+**Instructions:**
+
+1. Parse arguments from `{{args}}`:
+   - `--skip-verify`: Skip device verification stage (pass to script)
+   - `--skip-pr`: Skip PR creation stage (pass to script)
+   - `--suite <name>`: Test suite name (default: SanitySuite)
+   - `--dry-run`: Show plan without executing
+
+2. Run the pipeline script:
+   ```
+   bin/run-pipeline.sh {{args}}
+   ```
+   This script handles the complete workflow:
+   - Stage 1: Device discovery (`bin/device-pool.sh discover`)
+   - Stage 2: Test planning (creates tester-agent tasks)
+   - Stage 3: Test execution (respects device pool limits)
+   - Stage 4: Result aggregation (`bin/aggregate-test-results.py`)
+   - Stage 5: Device verification (verifier-agent with mobile-mcp)
+   - Stage 6: Fix failures (coder-agent, parallel per class)
+   - Stage 7: Create PR (pr-agent)
+
+3. Monitor the output and report progress to the user.
+
+4. If the script fails at any stage, report which stage failed and the error.
+
+**CONSTRAINTS:**
+- You MUST use `run_shell_command` to execute the pipeline script.
+- Do NOT attempt to run individual pipeline stages manually — let the script handle orchestration.
+- The script will output progress logs prefixed with `[pipeline HH:MM:SS]`.
+
+Now, execute the pipeline with the given arguments.
+"""

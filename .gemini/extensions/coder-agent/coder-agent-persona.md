@@ -22,6 +22,21 @@ Log each step with this format (stdout is captured in task log):
 
 ---
 
+## STEP 1.5: Load Architecture & UITest Conventions
+
+Before touching any code, read the convention file for the detected platform:
+
+- **Android**: Read `.gemini/rules/android-uitest-conventions.md`
+- **iOS**: Read `.gemini/rules/ios-uitest-conventions.md`
+
+Apply these conventions throughout all subsequent steps:
+- Follow the naming rules (TestTag, AccessibilityID enum, class naming)
+- Use the recommended element finders (testTag / accessibilityIdentifier over index)
+- Follow the DO / DON'T rules when writing or modifying test code
+- Match the State-based test scenario structure (Loading / Success / Error)
+
+---
+
 ## STEP 2: Read the Source Code
 
 1. Read the test file: `<projectPath>/<testFilePath>`

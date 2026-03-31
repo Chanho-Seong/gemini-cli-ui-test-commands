@@ -18,6 +18,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TASKS_DIR="$PROJECT_ROOT/.gemini/agents/tasks"
 
+# Source shared logging utility
+source "$SCRIPT_DIR/log-utils.sh"
+_LOG_SOURCE="reconcile"
+
 usage() {
   echo "Usage: $0 [OPTIONS]"
   echo "  (no args)     Run task reconciliation"
@@ -40,8 +44,45 @@ get_log_path() {
   fi
 }
 
+DEVICE_POOL_SCRIPT="$SCRIPT_DIR/device-pool.sh"
+
+# Release device lock for a task (find lock by taskId)
+release_device_for_task() {
+  local task_id="$1"
+  local locks_dir="$PROJECT_ROOT/.gemini/agents/state/locks"
+  [[ -d "$locks_dir" ]] || return 0
+
+  for lock_dir in "$locks_dir"/*.lock.d; do
+    [[ -d "$lock_dir" ]] || continue
+    [[ -f "$lock_dir/info.json" ]] || continue
+
+    local locked_by
+    if [[ "$USE_JQ" -eq 1 ]]; then
+      locked_by="$(jq -r '.taskId // ""' "$lock_dir/info.json" 2>/dev/null)"
+    else
+      locked_by="$(python3 -c "import json; print(json.load(open('$lock_dir/info.json')).get('taskId',''))" 2>/dev/null || echo "")"
+    fi
+
+    if [[ "$locked_by" == "$task_id" ]]; then
+      local device_id
+      device_id="$(basename "$lock_dir" .lock.d)"
+      if [[ -x "$DEVICE_POOL_SCRIPT" ]]; then
+        "$DEVICE_POOL_SCRIPT" release "$device_id" 2>/dev/null || rm -rf "$lock_dir"
+      else
+        rm -rf "$lock_dir"
+      fi
+      log_info "Released device $device_id (was locked by $task_id)"
+    fi
+  done
+}
+
 reconcile_tasks() {
   [[ -d "$TASKS_DIR" ]] || return 0
+
+  # Also run device pool cleanup if available
+  if [[ -x "$DEVICE_POOL_SCRIPT" ]]; then
+    "$DEVICE_POOL_SCRIPT" cleanup 2>/dev/null || true
+  fi
 
   for task_file in "$TASKS_DIR"/task_*.json; do
     [[ -f "$task_file" ]] || continue
@@ -58,6 +99,9 @@ reconcile_tasks() {
 
     log_path="$(get_log_path "$log_file")"
     log_contains_failure "$log_path" || continue
+
+    # Release any device lock held by this task
+    release_device_for_task "$task_id"
 
     # Reset status to pending, remove pid
     jq_del_status_pending "$task_file" > "${task_file}.tmp"
@@ -79,7 +123,7 @@ reconcile_tasks() {
     mv "${failed_path}.tmp" "$failed_path"
     rm -f "$excerpt_tmp"
 
-    echo "[reconcile] $task_id: running -> pending (retry #$retry_count)"
+    log_warn "$task_id: running -> pending (retry #$retry_count)"
   done
 }
 

@@ -13,7 +13,9 @@ This project is a proof-of-concept demonstrating a sub-agent orchestration syste
 ## Architecture
 
 -   **Orchestrator**: A set of custom Gemini CLI commands (`/agents:*`) that manage the entire lifecycle of agent tasks, from creation to completion.
--   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `coder-agent`, `reviewer-agent`).
+-   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `tester-agent`, `verifier-agent`, `coder-agent`, `pr-agent`).
+-   **Device Pool Manager**: A filesystem-based device locking system (`bin/device-pool.sh`) that manages parallel test execution across multiple mobile devices, preventing task conflicts.
+-   **Pipeline Orchestrator**: An end-to-end automation script (`bin/run-pipeline.sh`) that chains all stages from test execution to PR creation.
 
 ## Directory Structure
 
@@ -24,50 +26,114 @@ The entire system is contained within the `.gemini/` directory. This image shows
 -   `agents/`: Contains the definitions for the sub-agents and the workspace where they operate.
     -   `tasks/`: Contains the JSON state files for each task and `.done` sentinel files.
     -   `plans/`: Holds Markdown files for agents' long-term planning.
-    -   `logs/`: Stores the output logs from each agent's background process.
+    -   `logs/`: Stores the output logs, `uitest_results.json`, `device_verification.json`, `fix_report.json` from each agent.
     -   `workspace/`: A dedicated directory where agents can create and modify files.
+    -   `state/`: Device pool state (`device_pool.json`) and per-device lock files (`locks/`).
 -   `commands/`: Contains the `.toml` files that define the custom `/agents` commands.
+-   `extensions/`: Agent persona definitions (`tester-agent`, `verifier-agent`, `coder-agent`, `pr-agent`, etc.).
+-   `rules/`: Platform-specific test conventions (`android-uitest-conventions.md`, `ios-uitest-conventions.md`).
 
 ## Commands
 
+### Core Commands
 -   `/agents:start <agent_name> "<prompt>"`: Queues a new task by creating a JSON file in the `tasks` directory.
--   `/agents:run`: Executes the oldest pending task by launching the corresponding agent as a background process.
--   `/agents:status`: Reports the status of all tasks. It first reconciles any completed tasks by checking for `.done` files.
+-   `/agents:run [task_id]`: Executes the oldest pending task (or a specific task) by launching the corresponding agent as a background process.
+-   `/agents:run-all [agent_type] [--max-parallel N]`: Batch-executes all pending tasks with device pool limits. Automatically respects available device count for device-bound agents.
+-   `/agents:status [task_id]`: Reports the status of all tasks. It first reconciles any completed tasks by checking for `.done` files.
 -   `/agents:type`: Lists the available agent extensions.
 
-## Example Workflow
+### UITest Pipeline Commands
+-   `/agents:pipeline [--skip-verify] [--skip-pr] [--suite <name>]`: Runs the full end-to-end UITest pipeline (discover → test → aggregate → verify → fix → PR).
+-   `/agents:test-planing`: Scans workspace for CriticalRT test suite and creates per-class tester-agent tasks.
+-   `/agents:verify <uitest_results.json_path>`: Creates a verifier-agent task to verify failed tests on a real device.
+-   `/agents:fix <device_verification.json_path>`: Creates parallel coder-agent tasks (one per failing class) and launches them.
+-   `/agents:pr [project_path]`: Creates a pr-agent task to collect fix reports and open a GitHub PR.
 
-1.  **Queue a Task**:
+### Utility Scripts
+-   `bin/device-pool.sh`: Device pool manager — `discover`, `acquire`, `release`, `status`, `cleanup`, `count`.
+-   `bin/run-pipeline.sh`: Shell-based end-to-end pipeline orchestrator.
+-   `bin/aggregate-test-results.py`: Merges multiple `uitest_results.json` files into one aggregated file.
+-   `bin/run-agent-with-retry.sh`: Agent executor with model fallback and device pool integration.
+-   `bin/reconcile-tasks.sh`: Detects failed tasks, resets to pending, cleans up stale device locks.
+-   `bin/parse-android-test-results.py`: Parses JUnit XML test results into structured JSON.
+
+## Example Workflows
+
+### Quick Start: Full Pipeline (One Command)
+
+```bash
+# Run the entire UITest pipeline end-to-end
+bin/run-pipeline.sh
+
+# Or via Gemini CLI command
+gemini /agents:pipeline
+
+# With options
+bin/run-pipeline.sh --skip-verify --suite SanitySuite
+```
+
+### Step-by-Step: Manual Workflow
+
+1.  **Discover Devices**:
     ```bash
-    gemini /agents:start coder-agent "in a folder, use html/css/js (nicely designed) to build an app that looks at github.com/pauldatta and is a one-stop view of the repos and what they have been built for (public repos)"
+    bin/device-pool.sh discover
+    # Output: Discovered: Android 2 (2 idle), iOS 0 (0 idle)
     ```
-    **Output**: `Task task_20250726T183100Z created for agent 'coder-agent' and is now pending.`
 
-2.  **Run the Orchestrator**:
+2.  **Create Test Tasks**:
     ```bash
+    gemini /agents:test-planing
+    ```
+
+3.  **Run All Tests (device-limited parallelism)**:
+    ```bash
+    gemini /agents:run-all tester-agent
+    ```
+
+4.  **Aggregate Results**:
+    ```bash
+    python3 bin/aggregate-test-results.py
+    # Output: Total: 25, Passed: 22, Failed: 3
+    ```
+
+5.  **Verify Failures on Real Device**:
+    ```bash
+    gemini /agents:verify .gemini/agents/logs/aggregated_uitest_results.json
     gemini /agents:run
     ```
-    **Output**: `Orchestrator started task task_20250726T183100Z (PID: 13539) in the background.`
 
-3.  **Check the Status (While Running)**:
+6.  **Fix Failures**:
     ```bash
-    gemini /agents:status
+    gemini /agents:fix .gemini/agents/logs/task_xxx_device_verification.json
     ```
-    **Output**:
-    | Task ID | Agent | Status | Created At | PID | Prompt |
-    |---|---|---|---|---|---|
-    | task_20250726T183100Z | coder-agent | running | 2025-07-26T18:31:00Z | 13539 | in a folder, use html/css/js... |
 
-4.  **Check the Status (After Completion)**:
-    After the agent is finished, the next run of `/agents:status` will first reconcile the task and then display the final state.
+7.  **Create PR**:
     ```bash
-    gemini /agents:status
+    gemini /agents:pr
+    gemini /agents:run
     ```
-    **Output**:
-    `Task task_20250726T183100Z has been marked as complete.`
-    | Task ID | Agent | Status | Created At | PID | Prompt |
-    |---|---|---|---|---|---|
-    | task_20250726T183100Z | coder-agent | complete | 2025-07-26T18:31:00Z | 13539 | in a folder, use html/css/js... |
+
+### Legacy: Single Agent Task
+
+```bash
+gemini /agents:start coder-agent "Fix failing test in GlobalHomeAndroidViewTest"
+gemini /agents:run
+gemini /agents:status
+```
+
+## Device Pool Manager
+
+The device pool manager (`bin/device-pool.sh`) prevents multiple tasks from using the same mobile device simultaneously.
+
+-   **Filesystem-based locking**: Uses atomic `mkdir` for lock acquisition, consistent with the project's filesystem-as-state architecture.
+-   **Automatic integration**: `run-agent-with-retry.sh` automatically acquires/releases devices for `tester-agent` and `verifier-agent`.
+-   **Stale lock cleanup**: Dead PIDs and TTL-expired locks (30 min) are automatically cleaned up during reconciliation.
+
+```bash
+bin/device-pool.sh discover   # Scan connected devices
+bin/device-pool.sh status     # Show device pool state
+bin/device-pool.sh cleanup    # Remove stale locks
+```
 
 ### Final Output
 

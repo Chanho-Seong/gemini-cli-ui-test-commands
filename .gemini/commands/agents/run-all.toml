@@ -1,0 +1,73 @@
+description = "Runs all pending agent tasks in parallel with device pool limits: /agents:run-all [agent_type] [--max-parallel N]"
+prompt = """
+You are the master Orchestrator, running as a **Batch Executor**. Your job is to find and execute ALL pending tasks, respecting device pool limits.
+
+**Optional Arguments:**
+- Agent type filter: `{{arg0}}` (e.g., `tester-agent`). If provided, only run tasks for that agent type. If empty, run all pending tasks.
+- Max parallel: `{{arg1}}` (e.g., `3`). If provided, limit concurrent tasks. If empty, use device count for device-bound agents or 5 for others.
+
+**Behavior:**
+
+**Step 1 — Discover devices (for device-bound agents):**
+Run: `bin/device-pool.sh discover`
+Then run: `bin/device-pool.sh count android` and `bin/device-pool.sh count ios`
+This tells you the max parallel tasks for `tester-agent` and `verifier-agent`.
+
+**Step 2 — Find all pending tasks:**
+Scan `.gemini/agents/tasks/` for all `.json` files where `"status": "pending"`.
+If `{{arg0}}` is provided, filter by `"agent": "{{arg0}}"`.
+Sort by `createdAt` (oldest first).
+
+If no pending tasks are found, output "No pending tasks." and stop.
+
+**Step 3 — Determine parallelism:**
+- For `tester-agent` and `verifier-agent`: max parallel = number of idle devices for the project's OS (from Step 1).
+  If `{{arg1}}` is provided AND is less than device count, use `{{arg1}}` instead.
+- For `coder-agent`, `pr-agent`, `reviewer-agent`: max parallel = `{{arg1}}` or 5 (whichever is smaller).
+  These agents don't need devices.
+
+**Step 4 — Launch tasks in batches:**
+Group pending tasks by agent type. For each group:
+
+4-1. For device-bound agents (`tester-agent`, `verifier-agent`):
+   - For each task (up to max parallel), run:
+     ```
+     bin/run-agent-with-retry.sh <agent> <task_id> <log_file> "<prompt>" &
+     ```
+   - Update task JSON: set `status` to `"running"`.
+   - Wait for batch to finish (monitor `.done` files or use `wait`).
+   - After each task completes, the next pending task in the queue can start.
+
+4-2. For non-device-bound agents (`coder-agent`, `pr-agent`, etc.):
+   - Launch up to max parallel tasks at once with `&`.
+   - Update each task JSON to `"running"`.
+
+**Step 5 — Monitor and report:**
+After launching all tasks, output a summary table:
+
+| Task ID | Agent | Status | Device |
+|---------|-------|--------|--------|
+| task_... | tester-agent | launched | emulator-5554 |
+| task_... | coder-agent | launched | N/A |
+| task_... | tester-agent | queued (waiting for device) | - |
+
+Then output: "Launched X tasks, Y queued. Monitor with /agents:status"
+
+**Step 6 — Wait loop for device-bound tasks (if any):**
+If there are more pending device-bound tasks than available devices:
+- Use a polling loop: every 15 seconds, check for `.done` files.
+- When a device-bound task completes:
+  1. The device is released automatically by `run-agent-with-retry.sh`.
+  2. Pick the next queued device-bound task.
+  3. Launch it with `run-agent-with-retry.sh ... &`.
+  4. Update its status to `"running"`.
+- Continue until all tasks are launched or running.
+
+**CONSTRAINTS:**
+- You MUST use `run_shell_command` to execute all commands.
+- Do NOT use shell substitution `$(...)` in echo JSON strings.
+- All file paths relative to project root.
+- If `bin/device-pool.sh` is not found or fails, fall back to launching tasks without device management (max parallel = `{{arg1}}` or 3).
+
+Now, parse arguments and begin batch execution.
+"""

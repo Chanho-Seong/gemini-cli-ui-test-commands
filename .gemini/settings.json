@@ -1,5 +1,34 @@
 {
   "theme": "Shades Of Purple",
+  "hooks": {
+    "AfterTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {
+            "name": "pipeline-stage-notify",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.gemini/hooks/notify-stage.sh",
+            "timeout": 5000,
+            "description": "파이프라인 단계 완료 시 macOS 데스크톱 알림 전송"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "hooks": [
+          {
+            "name": "pipeline-done-notify",
+            "type": "command",
+            "command": "$GEMINI_PROJECT_DIR/.gemini/hooks/notify-pipeline-done.sh",
+            "timeout": 5000,
+            "description": "파이프라인 전체 완료 시 최종 알림 전송"
+          }
+        ]
+      }
+    ]
+  },
   "mcpServers": {
     "context7-mcp": {
       "url": "https://server.smithery.ai/upstash/context7-mcp/mcp",

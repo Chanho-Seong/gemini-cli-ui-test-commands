@@ -111,7 +111,7 @@ gh pr create \
   --body "$(cat <<'PREOF'
 ## Summary
 
-Fixes **<N> failing UI tests** confirmed by the automated test pipeline (tester-agent → verifier-agent → coder-agent).
+Fixes **<N> failing UI tests** confirmed by the automated test pipeline (test-runner → verifier-agent → coder-agent).
 
 ## Fixed Tests
 
@@ -125,7 +125,7 @@ Fixes **<N> failing UI tests** confirmed by the automated test pipeline (tester-
 
 ## Pipeline
 
-1. `tester-agent` — ran UI tests, detected failures
+1. `run-test-android.sh` — ran UI tests, detected failures
 2. `verifier-agent` — confirmed failures on real device
 3. `coder-agent` — applied targeted code fixes
 4. `pr-agent` — created this PR

@@ -1,34 +1,131 @@
-description = "Creates a verifier-agent task to verify failed UI tests: /agents:verify <uitest_results.json_path>"
+description = "테스트 결과에서 실패 클래스별 verifier-agent 태스크를 생성합니다: /agents:verify <uitest_results.json | shard_log_dir>"
 prompt = """
-You are the Orchestrator's setup assistant. Your job is to create the necessary files to queue a verifier-agent task.
+당신은 오케스트레이터의 **검증 태스크 생성기**입니다. 테스트 결과 파일(JSON 또는 shard 로그 디렉토리)을 읽어 실패한 테스트 클래스별로 verifier-agent 태스크를 생성하는 것이 역할입니다.
 
-**CRITICAL: You MUST use the `run_shell_command` tool to actually execute the echo commands. Do NOT just output the commands as text - you must run them to create the files.**
+**중요: 반드시 `run_shell_command` 도구를 사용하여 모든 셸 명령을 실행해야 합니다. 명령어를 텍스트로만 출력하지 마세요 — 반드시 실행하세요.**
 
-**User Argument:**
-- UITest Results File Path: `{{args}}` or `{{arg0}}` (single argument: path to *_uitest_results.json)
-  (If both are empty, parse the path from the user's command appended below.)
+**사용자 인자:** `{{args}}` 또는 `{{arg0}}`
 
-**Instructions:**
-1. Parse the uitest results file path from `{{args}}` or the appended command. Use it as-is (relative paths are fine).
-2. Generate a unique Task ID: use `task_` + current Unix timestamp (e.g., task_1740556800). Call this TASK_ID.
-3. Generate the full JSON for the task file. The `createdAt` field must be current ISO timestamp (e.g., 2025-02-27T00:00:00Z). The `prompt` field must instruct verifier-agent to:
-   - Read the uitest results file at the given path
-   - Verify each entry in `failedTests` on the connected device using mobile-mcp tools
-   - Write the result to `.gemini/agents/logs/<TASK_ID>_device_verification.json`
-   - Create `.gemini/agents/tasks/<TASK_ID>.done` when finished
-4. Use `run_shell_command` to execute: `echo '<JSON_CONTENT>' > .gemini/agents/tasks/<TASK_ID>.json`
-5. Use `run_shell_command` to execute: `echo '# Plan for verifier-agent - Verify failedTests from <path>' > .gemini/agents/plans/<TASK_ID>_plan.md`
-6. Output a confirmation message to the user.
+---
 
-**Example JSON structure:**
-```json
-{"taskId":"task_1740556800","status":"pending","agent":"verifier-agent","prompt":"You are the verifier-agent. Your Task ID is task_1740556800. Read the uitest results file at .gemini/agents/logs/task_1708499261_8_uitest_results.json and verify each failed test in failedTests on the real device. Follow your persona instructions and create the .done file when finished.","planFile":".gemini/agents/plans/task_1740556800_plan.md","logFile":".gemini/agents/logs/task_1740556800.log","createdAt":"2025-02-27T00:00:00Z"}
+## 1단계 — 입력 판별, 플랫폼 감지 및 결과 파일 확보
+
+`{{args}}`에서 입력 경로를 파싱합니다. 입력 유형에 따라 처리 방식이 다릅니다:
+
+**A. JSON 파일인 경우** (경로가 `.json`으로 끝남):
+- `run_shell_command`로 `cat <path>` 실행하여 JSON 내용을 읽습니다.
+- 파일이 존재하지 않으면 "파일을 찾을 수 없습니다: <path>" 출력 후 중단합니다.
+
+**B. 디렉토리인 경우** (`.json`으로 끝나지 않음):
+- 먼저 shard 로그 파싱을 실행합니다:
+  ```shell
+  python3 bin/parse-am-instrument-results.py --shard-dir <path> --output-dir .gemini/agents/logs
+  ```
+- 파싱이 완료되면 생성된 결과 파일을 읽습니다:
+  - `.gemini/agents/logs/all_uitest_results.json` 파일이 생성되었는지 확인
+  - 또는 `.gemini/agents/logs/*_uitest_results.json` 파일들을 탐색
+  ```shell
+  cat .gemini/agents/logs/all_uitest_results.json
+  ```
+- shard 로그가 없거나 파싱에 실패하면 오류 메시지를 출력하고 중단합니다.
+
+**플랫폼 감지:**
+`.gemini/agents/workspace/` 하위 프로젝트 디렉터리를 스캔하여 플랫폼을 판별합니다:
+- `build.gradle`, `build.gradle.kts` 파일이 존재하면 → **Android**
+- `.xcodeproj`, `.xcworkspace` 파일이 존재하면 → **iOS**
+- JSON 결과 파일에 `platform` 필드가 있으면 해당 값을 우선 사용합니다.
+- 판별된 플랫폼 값(`Android` 또는 `iOS`)을 이후 프롬프트 생성 시 `<PLATFORM>`으로 사용합니다.
+
+## 2단계 — 실패 클래스 및 테스트 메서드 추출
+
+읽어들인 JSON에서 `failedTests` 배열을 분석합니다:
+
+1. `failedTests` 배열에서 고유한 `className` 값들을 추출합니다.
+2. 각 className별로 해당되는 실패 테스트의 `methodName`(테스트 케이스 이름) 목록을 수집합니다.
+3. `failedTests`가 비어 있거나 존재하지 않으면 "실패한 테스트가 없습니다. 검증이 필요하지 않습니다." 출력 후 중단합니다.
+
+## 3단계 — 클래스별 verifier-agent 태스크 생성
+
+추출된 각 고유 className에 대해 하나의 verifier-agent 태스크를 생성합니다:
+
+3-1. **Task ID 생성**:
+  - 첫 번째 클래스: `task_<unix_timestamp>_verify_0`
+  - 이후 클래스: 접미사 증가 (`_verify_1`, `_verify_2`, ...)
+  - Unix timestamp는 리터럴 값을 사용합니다. `$(...)` 치환을 사용하지 마세요.
+
+3-2. **verifier-agent 프롬프트 구성** (한국어):
+
+프롬프트에는 결과 파일 경로 대신, 2단계에서 추출한 **실패 테스트 케이스 이름(methodName) 목록을 직접 포함**합니다.
+
+```
+당신은 verifier-agent입니다. Task ID는 <TASK_ID>입니다.
+
+플랫폼: <PLATFORM>
+테스트 클래스 "<CLASS_NAME>"의 다음 테스트 케이스들이 실패했습니다. 실제 디바이스에서 검증하세요.
+
+실패 테스트 케이스:
+- <METHOD_NAME_1>
+- <METHOD_NAME_2>
+- <METHOD_NAME_3>
+...
+
+검증 절차:
+1. 워크스페이스에서 "<CLASS_NAME>" 테스트 소스 코드 파일을 찾아 읽으세요.
+2. 위에 나열된 각 실패 테스트 케이스의 소스 코드를 분석하여 테스트 시나리오(사전 조건, 실행 단계, 기대 결과)를 파악하세요.
+3. 파악한 시나리오를 기반으로 테스트별 체크리스트를 작성하여 planFile(<PLAN_FILE_PATH>)에 기록하세요. 체크리스트는 각 테스트의 단계별 검증 항목을 포함해야 합니다.
+4. planFile에 기록한 체크리스트에 따라 mobile-mcp 도구를 사용하여 실제 디바이스에서 각 시나리오를 순서대로 재현하세요.
+5. 동일한 기능적 목표를 다른 경로로 달성할 수 있다면 PASSED로 판정하세요.
+6. 결과를 .gemini/agents/logs/<TASK_ID>_device_verification.json에 기록하세요.
+7. 완료 시 .gemini/agents/tasks/<TASK_ID>.done 파일을 생성하세요.
 ```
 
-**CRITICAL:**
-- You MUST NOT use shell substitution like `$(...)` or backticks in the command string.
-- You MUST call run_shell_command for each echo - do not skip execution.
-- Escape inner double quotes in the JSON for the shell: use single quotes around the whole JSON, and ensure any single quotes inside are handled (e.g., avoid apostrophes in the prompt text).
+3-3. **태스크 JSON 작성**:
+```shell
+echo '{"taskId":"<TASK_ID>","status":"pending","agent":"verifier-agent","prompt":"<PROMPT>","planFile":".gemini/agents/plans/<TASK_ID>_plan.md","logFile":".gemini/agents/logs/<TASK_ID>.log","createdAt":"<ISO_TIMESTAMP>"}' > .gemini/agents/tasks/<TASK_ID>.json
+```
 
-Now, parse the path, generate TASK_ID and JSON, then run the commands via run_shell_command.
+3-4. **Plan 파일 작성**:
+```shell
+echo '# Plan for verifier-agent - <CLASS_NAME> 실패 테스트 검증' > .gemini/agents/plans/<TASK_ID>_plan.md
+```
+
+## 4단계 — 결과 요약
+
+모든 태스크 생성이 완료되면 마크다운 테이블을 출력합니다:
+
+| Task ID | 플랫폼 | 대상 클래스 | 실패 테스트 케이스 | 상태 |
+|---------|--------|------------|-------------------|------|
+| task_..._verify_0 | Android | kr.co.example.SomeTest | testA, testB, testC | pending |
+| task_..._verify_1 | Android | kr.co.example.OtherTest | testX, testY | pending |
+
+그 후 다음 단계를 안내합니다:
+- 검증 태스크 실행: `/agents:run-all verifier-agent`
+- 상태 확인: `/agents:status`
+
+---
+
+**예시 (className이 2개인 경우):**
+
+```shell
+# 태스크 1: SanityAppLaunchTest (실패 케이스: testAppLaunch, testSplashScreen, testMainActivity, testDeepLink, testColdStart)
+echo '{"taskId":"task_1740556800_verify_0","status":"pending","agent":"verifier-agent","prompt":"당신은 verifier-agent입니다. Task ID는 task_1740556800_verify_0입니다.\n\n플랫폼: Android\n테스트 클래스 kr.co.yogiyo.presentation.sanity.SanityAppLaunchTest의 다음 테스트 케이스들이 실패했습니다. 실제 디바이스에서 검증하세요.\n\n실패 테스트 케이스:\n- testAppLaunch\n- testSplashScreen\n- testMainActivity\n- testDeepLink\n- testColdStart\n\n검증 절차:\n1. 워크스페이스에서 SanityAppLaunchTest 테스트 소스 코드 파일을 찾아 읽으세요.\n2. 위에 나열된 각 실패 테스트 케이스의 소스 코드를 분석하여 테스트 시나리오(사전 조건, 실행 단계, 기대 결과)를 파악하세요.\n3. 파악한 시나리오를 기반으로 테스트별 체크리스트를 작성하여 planFile(.gemini/agents/plans/task_1740556800_verify_0_plan.md)에 기록하세요.\n4. planFile에 기록한 체크리스트에 따라 mobile-mcp 도구로 실제 디바이스에서 각 시나리오를 순서대로 재현하세요.\n5. 동일 기능을 다른 경로로 달성 가능하면 PASSED로 판정하세요.\n6. 결과를 .gemini/agents/logs/task_1740556800_verify_0_device_verification.json에 기록하세요.\n7. 완료 시 .gemini/agents/tasks/task_1740556800_verify_0.done을 생성하세요.","planFile":".gemini/agents/plans/task_1740556800_verify_0_plan.md","logFile":".gemini/agents/logs/task_1740556800_verify_0.log","createdAt":"2026-04-02T10:00:00Z"}' > .gemini/agents/tasks/task_1740556800_verify_0.json
+
+echo '# Plan for verifier-agent - SanityAppLaunchTest 실패 테스트 검증' > .gemini/agents/plans/task_1740556800_verify_0_plan.md
+
+# 태스크 2: GlobalHomeAndroidViewTest (실패 케이스: testHomeLoading, testBannerDisplay, testCategoryScroll)
+echo '{"taskId":"task_1740556800_verify_1","status":"pending","agent":"verifier-agent","prompt":"당신은 verifier-agent입니다. Task ID는 task_1740556800_verify_1입니다.\n\n플랫폼: Android\n테스트 클래스 kr.co.yogiyo.presentation.home.GlobalHomeAndroidViewTest의 다음 테스트 케이스들이 실패했습니다. 실제 디바이스에서 검증하세요.\n\n실패 테스트 케이스:\n- testHomeLoading\n- testBannerDisplay\n- testCategoryScroll\n\n검증 절차:\n1. 워크스페이스에서 GlobalHomeAndroidViewTest 테스트 소스 코드 파일을 찾아 읽으세요.\n2. 위에 나열된 각 실패 테스트 케이스의 소스 코드를 분석하여 테스트 시나리오(사전 조건, 실행 단계, 기대 결과)를 파악하세요.\n3. 파악한 시나리오를 기반으로 테스트별 체크리스트를 작성하여 planFile(.gemini/agents/plans/task_1740556800_verify_1_plan.md)에 기록하세요.\n4. planFile에 기록한 체크리스트에 따라 mobile-mcp 도구로 실제 디바이스에서 각 시나리오를 순서대로 재현하세요.\n5. 동일 기능을 다른 경로로 달성 가능하면 PASSED로 판정하세요.\n6. 결과를 .gemini/agents/logs/task_1740556800_verify_1_device_verification.json에 기록하세요.\n7. 완료 시 .gemini/agents/tasks/task_1740556800_verify_1.done을 생성하세요.","planFile":".gemini/agents/plans/task_1740556800_verify_1_plan.md","logFile":".gemini/agents/logs/task_1740556800_verify_1.log","createdAt":"2026-04-02T10:00:00Z"}' > .gemini/agents/tasks/task_1740556800_verify_1.json
+
+echo '# Plan for verifier-agent - GlobalHomeAndroidViewTest 실패 테스트 검증' > .gemini/agents/plans/task_1740556800_verify_1_plan.md
+```
+
+---
+
+**제약 사항:**
+- 반드시 `run_shell_command`를 사용하여 모든 파일 쓰기를 실행하세요.
+- 셸 명령 내에서 `$(...)` 또는 백틱 치환을 사용하지 마세요.
+- JSON 문자열은 single-quote `'...'`로 감싸세요. 프롬프트 내부에 apostrophe(`'`)를 사용하지 마세요.
+- className당 정확히 1개의 태스크만 생성하세요 (중복 금지).
+- 모든 파일 경로는 프로젝트 루트 기준 상대 경로를 사용하세요.
+
+이제 `{{args}}`를 파싱하고 태스크 생성을 시작하세요.
 """

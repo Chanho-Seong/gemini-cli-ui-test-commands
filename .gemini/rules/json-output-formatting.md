@@ -38,7 +38,7 @@ JSON 파일을 `run_shell_command`의 `echo` 등으로 작성할 때:
 
 ## 5. 적용 대상
 
-- **tester-agent**: `*_uitest_results.json` 작성 시
+- **run-test-android.sh** + **parse-am-instrument-results.py**: `*_uitest_results.json` 작성 시
 - **verifier-agent**: `*_device_verification.json` 작성 시
 - **parse-android-test-results.py**: `json.dumps()` 사용으로 자동 이스케이프됨 (추가 조치 불필요)
 

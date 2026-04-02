@@ -13,9 +13,10 @@ This project is a proof-of-concept demonstrating a sub-agent orchestration syste
 ## Architecture
 
 -   **Orchestrator**: A set of custom Gemini CLI commands (`/agents:*`) that manage the entire lifecycle of agent tasks, from creation to completion.
--   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `tester-agent`, `verifier-agent`, `coder-agent`, `pr-agent`).
+-   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `verifier-agent`, `coder-agent`, `pr-agent`). Test execution is handled directly by shell scripts (`run-test-android.sh`, `run-test-ios.sh`) without AI agent overhead.
 -   **Device Pool Manager**: A filesystem-based device locking system (`bin/device-pool.sh`) that manages parallel test execution across multiple mobile devices, preventing task conflicts.
 -   **Pipeline Orchestrator**: An end-to-end automation script (`bin/run-pipeline.sh`) that chains all stages from test execution to PR creation.
+-   **Lifecycle Hooks**: macOS desktop notifications via `.gemini/hooks/` that alert on pipeline stage transitions and completion.
 
 ## Directory Structure
 
@@ -30,8 +31,9 @@ The entire system is contained within the `.gemini/` directory. This image shows
     -   `workspace/`: A dedicated directory where agents can create and modify files.
     -   `state/`: Device pool state (`device_pool.json`) and per-device lock files (`locks/`).
 -   `commands/`: Contains the `.toml` files that define the custom `/agents` commands.
--   `extensions/`: Agent persona definitions (`tester-agent`, `verifier-agent`, `coder-agent`, `pr-agent`, etc.).
--   `rules/`: Platform-specific test conventions (`android-uitest-conventions.md`, `ios-uitest-conventions.md`).
+-   `extensions/`: Agent persona definitions (`verifier-agent`, `coder-agent`, `pr-agent`, `tdd-agent`, `reviewer-agent`, `base-orchestrator`).
+-   `hooks/`: Lifecycle hooks for desktop notifications (`notify-stage.sh`, `notify-pipeline-done.sh`).
+-   `rules/`: Platform-specific test conventions (`android-uitest-conventions.md`, `ios-uitest-conventions.md`) and JSON output formatting rules.
 
 ## Commands
 
@@ -43,19 +45,27 @@ The entire system is contained within the `.gemini/` directory. This image shows
 -   `/agents:type`: Lists the available agent extensions.
 
 ### UITest Pipeline Commands
--   `/agents:pipeline [--skip-verify] [--skip-pr] [--suite <name>]`: Runs the full end-to-end UITest pipeline (discover → test → aggregate → verify → fix → PR).
--   `/agents:test-planing`: Scans workspace for CriticalRT test suite and creates per-class tester-agent tasks.
--   `/agents:verify <uitest_results.json_path>`: Creates a verifier-agent task to verify failed tests on a real device.
+-   `/agents:pipeline [--skip-verify] [--skip-pr] [--suite <name>] [--class <name>...] [--pattern <glob>]`: Runs the full end-to-end UITest pipeline (discover → test → aggregate → verify → fix → PR).
+-   `/agents:run-test [--variant <name>] [--module <name>] [--class <fqn>...] [--suite <name>] [--dry-run]`: Auto-detects Android/iOS projects in workspace and delegates to platform-specific test scripts. Supports multi-project selection.
+-   `/agents:verify <uitest_results.json_path>`: Creates verifier-agent tasks to verify failed tests on real devices. Supports multi-device parallel verification with failure sharding.
 -   `/agents:fix <device_verification.json_path>`: Creates parallel coder-agent tasks (one per failing class) and launches them.
 -   `/agents:pr [project_path]`: Creates a pr-agent task to collect fix reports and open a GitHub PR.
 
 ### Utility Scripts
 -   `bin/device-pool.sh`: Device pool manager — `discover`, `acquire`, `release`, `status`, `cleanup`, `count`.
--   `bin/run-pipeline.sh`: Shell-based end-to-end pipeline orchestrator.
+-   `bin/run-pipeline.sh`: Shell-based end-to-end pipeline orchestrator with `--skip-verify`, `--skip-pr`, `--suite`, `--class`, `--pattern`, `--dry-run` options.
+-   `bin/create-test-tasks.py`: Parses test suite annotations and creates tester-agent task files without Gemini API calls. Supports `--suite`, `--class`, `--pattern` modes.
+-   `bin/run-test-android.sh`: Builds APK once, installs on all devices, and runs tests via `am instrument` with sharding. Bypasses Gemini API.
+-   `bin/run-test-ios.sh`: Runs iOS UI tests via `xcodebuild test` with device pool integration. Bypasses Gemini API.
+-   `bin/parse-am-instrument-results.py`: Parses `am instrument` shard logs into per-task `uitest_results.json` files.
 -   `bin/aggregate-test-results.py`: Merges multiple `uitest_results.json` files into one aggregated file.
--   `bin/run-agent-with-retry.sh`: Agent executor with model fallback and device pool integration.
+-   `bin/merge-verification-results.py`: Consolidates multi-device verifier-agent results into a unified JSON. Falls back to aggregated results if verification is skipped.
+-   `bin/split-failures.py`: Round-robin distributes failed tests across N verification shards for parallel device verification.
+-   `bin/run-agent-with-retry.sh`: Agent executor with model fallback and device pool integration (for verifier/coder/pr agents).
 -   `bin/reconcile-tasks.sh`: Detects failed tasks, resets to pending, cleans up stale device locks.
+-   `bin/reset-tasks.sh`: Task reset/cleanup utility with `--running`, `--agent`, `--clean`, `--dry-run` modes. Kills related processes and clears logs/sentinels/locks.
 -   `bin/parse-android-test-results.py`: Parses JUnit XML test results into structured JSON.
+-   `bin/log-utils.sh`: Shared logging functions (sourced by other shell scripts).
 
 ## Example Workflows
 
@@ -70,6 +80,12 @@ gemini /agents:pipeline
 
 # With options
 bin/run-pipeline.sh --skip-verify --suite SanitySuite
+
+# Run specific test classes
+bin/run-pipeline.sh --class CartAndroidViewTest
+
+# Run tests matching a pattern
+bin/run-pipeline.sh --pattern "*Order*"
 ```
 
 ### Step-by-Step: Manual Workflow
@@ -82,12 +98,26 @@ bin/run-pipeline.sh --skip-verify --suite SanitySuite
 
 2.  **Create Test Tasks**:
     ```bash
-    gemini /agents:test-planing
+    # Suite-based (default: SanitySuite)
+    python3 bin/create-test-tasks.py
+
+    # Specific suite
+    python3 bin/create-test-tasks.py --suite SanitySuite
+
+    # Specific test classes
+    python3 bin/create-test-tasks.py --class CartAndroidViewTest --class SearchAndroidViewTest
+
+    # Pattern-based
+    python3 bin/create-test-tasks.py --pattern "*Home*"
     ```
 
-3.  **Run All Tests (device-limited parallelism)**:
+3.  **Run All Tests (device-limited parallelism, no Gemini API)**:
     ```bash
+    # Batch execution (run-all internally uses run-test-android.sh for tester-agent tasks)
     gemini /agents:run-all tester-agent
+
+    # Or direct execution:
+    bin/run-test-android.sh --variant googleBeta --module yogiyo --class com.example.MyTest
     ```
 
 4.  **Aggregate Results**:
@@ -126,7 +156,7 @@ gemini /agents:status
 The device pool manager (`bin/device-pool.sh`) prevents multiple tasks from using the same mobile device simultaneously.
 
 -   **Filesystem-based locking**: Uses atomic `mkdir` for lock acquisition, consistent with the project's filesystem-as-state architecture.
--   **Automatic integration**: `run-agent-with-retry.sh` automatically acquires/releases devices for `tester-agent` and `verifier-agent`.
+-   **Automatic integration**: `run-test-android.sh` and `run-agent-with-retry.sh` automatically acquire/release devices for test execution and `verifier-agent`.
 -   **Stale lock cleanup**: Dead PIDs and TTL-expired locks (30 min) are automatically cleaned up during reconciliation.
 
 ```bash
@@ -134,12 +164,6 @@ bin/device-pool.sh discover   # Scan connected devices
 bin/device-pool.sh status     # Show device pool state
 bin/device-pool.sh cleanup    # Remove stale locks
 ```
-
-### Final Output
-
-The `coder-agent` successfully creates a web application in the `.gemini/agents/workspace/github-repo-viewer` directory. Here is a screenshot of the final running application:
-
-![GitHub Repo Viewer Screenshot](media/github-repo-viewer.png)
 
 ---
 

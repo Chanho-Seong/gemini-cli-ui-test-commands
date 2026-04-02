@@ -7,8 +7,8 @@
 #   bin/run-agent-with-retry.sh <agent> <task_id> <log_file> "<prompt>" [--device-os <os>] &
 #
 # 모델 선택 (최대 3회 재시도, 총 4회 시도):
-#   - tester-agent: gemini-3-flash-preview -> gemini-3-pro-preview -> gemini-2.5-pro -> gemini-2.5-flash
-#   - coder-agent 등 복잡한 에이전트: gemini-3-pro-preview -> gemini-3-flash-preview -> gemini-2.5-pro -> gemini-2.5-flash
+#   gemini-3-pro-preview -> gemini-2.5-pro -> gemini-3-flash-preview -> gemini-2.5-flash
+#   (tester-agent는 run-test-android.sh로 대체됨 — 이 스크립트는 verifier/coder/pr-agent용)
 #
 # 디바이스 풀 연동 (--device-os 옵션):
 #   tester-agent, verifier-agent 실행 시 자동으로 디바이스를 acquire/release 합니다.
@@ -42,6 +42,13 @@ AGENT="$1"
 TASK_ID="$2"
 LOG_FILE="$3"
 PROMPT="$4"
+
+# task_id 유효성 검사: task_ 접두어 필수 (인자 순서 오류 방지)
+if [[ ! "$TASK_ID" =~ ^task_ ]]; then
+  echo "Error: Invalid task_id '$TASK_ID'. Must start with 'task_'." >&2
+  echo "Hint: Check argument order — $0 <agent> <task_id> <log_file> \"<prompt>\"" >&2
+  exit 1
+fi
 DEVICE_OS=""
 DEVICE_ID=""
 
@@ -55,7 +62,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Auto-detect device OS for device-bound agents
-if [[ -z "$DEVICE_OS" ]] && [[ "$AGENT" == "tester-agent" || "$AGENT" == "verifier-agent" ]]; then
+if [[ -z "$DEVICE_OS" ]] && [[ "$AGENT" == "verifier-agent" ]]; then
   # Default to android if not specified
   DEVICE_OS="android"
 fi
@@ -76,11 +83,8 @@ fi
 _LOG_FILE="$LOG_PATH"
 
 # 에이전트별 모델 순서 (최대 3회 재시도)
-if [[ "$AGENT" == "tester-agent" ]]; then
-  MODELS=(gemini-3-flash-preview gemini-2.5-flash gemini-3-pro-preview gemini-2.5-pro)
-else
-  MODELS=(gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview gemini-2.5-flash)
-fi
+# tester-agent는 run-test-android.sh로 대체되어 더 이상 Gemini API를 사용하지 않음
+MODELS=(gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview gemini-2.5-flash)
 MAX_RETRIES=3
 
 log_contains_capacity_error() {

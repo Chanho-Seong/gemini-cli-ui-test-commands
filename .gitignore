@@ -8,10 +8,10 @@
 
 # Gemini CLI Agent State & Artifacts
 # Ignore the contents of the agent state directories...
-/.gemini/agents/tasks/*
-/.gemini/agents/logs/*
-/.gemini/agents/plans/*
-/.gemini/agents/workspace/*
+.gemini/agents/tasks/*
+.gemini/agents/logs/*
+.gemini/agents/plans/*
+.gemini/agents/workspace/*
 
 # ...but NOT the .gitkeep files, which preserve the directory structure.
 !/.gemini/agents/**/.gitkeep
@@ -25,3 +25,5 @@ Thumbs.db
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+bin/__pycache__

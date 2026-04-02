@@ -26,8 +26,8 @@ You are the master Orchestrator, running as a **Reconciler**. Your job is to exe
 4. Announce: "Orchestrator started task <TASK_ID> (PID: <pid>) in the background."
 
 **Model selection (handled by bin/run-agent-with-retry.sh)**:
-- `tester-agent`: flash (1차) → pro (용량 오류 시 재시도)
-- `coder-agent`, `verifier-agent`, `reviewer-agent`, `pr-agent` 등: pro (1차) → flash (용량 오류 시 재시도)
+- 모든 에이전트: pro (1차) → flash (용량 오류 시 재시도)
+- 참고: 테스트 실행은 run-test-android.sh로 직접 수행 (Gemini API 미사용)
 
 **Example for task_123 with agent coder-agent:**
 ```shell

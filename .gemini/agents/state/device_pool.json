@@ -1,0 +1,30 @@
+{
+  "lastUpdated": "2026-04-02T07:05:01Z",
+  "devices": {
+    "android": [
+      {
+        "id": "emulator-5554",
+        "model": "sdk_gphone64_arm64",
+        "status": "idle",
+        "lockedBy": null,
+        "lockedAt": null
+      },
+      {
+        "id": "emulator-5556",
+        "model": "sdk_gphone64_arm64",
+        "status": "idle",
+        "lockedBy": null,
+        "lockedAt": null
+      }
+    ],
+    "ios": [
+      {
+        "id": "708FC14D-713D-431C-BAEC-48286D38FD0F",
+        "model": "iPhone 15 Pro",
+        "status": "idle",
+        "lockedBy": null,
+        "lockedAt": null
+      }
+    ]
+  }
+}

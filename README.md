@@ -13,7 +13,7 @@ This project is a proof-of-concept demonstrating a sub-agent orchestration syste
 ## Architecture
 
 -   **Orchestrator**: A set of custom Gemini CLI commands (`/agents:*`) that manage the entire lifecycle of agent tasks, from creation to completion.
--   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `verifier-agent`, `coder-agent`, `pr-agent`). Test execution is handled directly by shell scripts (`run-test-android.sh`, `run-test-ios.sh`) without AI agent overhead.
+-   **Sub-Agents**: Specialized Gemini CLI extensions, each with a unique persona and a constrained set of capabilities (e.g., `verifier-agent`, `coder-agent`, `pr-agent`). `verifier-agent`는 동시 실행 안정성을 위해 flash 모델을 우선 사용합니다. Test execution is handled directly by shell scripts (`run-test-android.sh`, `run-test-ios.sh`) without AI agent overhead.
 -   **Device Pool Manager**: A filesystem-based device locking system (`bin/device-pool.sh`) that manages parallel test execution across multiple mobile devices, preventing task conflicts.
 -   **Pipeline Orchestrator**: An end-to-end automation script (`bin/run-pipeline.sh`) that chains all stages from test execution to PR creation.
 -   **Lifecycle Hooks**: macOS desktop notifications via `.gemini/hooks/` that alert on pipeline stage transitions and completion.
@@ -31,7 +31,7 @@ The entire system is contained within the `.gemini/` directory. This image shows
     -   `workspace/`: A dedicated directory where agents can create and modify files.
     -   `state/`: Device pool state (`device_pool.json`) and per-device lock files (`locks/`).
 -   `commands/`: Contains the `.toml` files that define the custom `/agents` commands.
--   `extensions/`: Agent persona definitions (`verifier-agent`, `coder-agent`, `pr-agent`, `tdd-agent`, `reviewer-agent`, `base-orchestrator`).
+-   `extensions/`: Agent persona definitions (`verifier-agent`, `coder-agent`, `pr-agent`, `tdd-agent`, `base-orchestrator`).
 -   `hooks/`: Lifecycle hooks for desktop notifications (`notify-stage.sh`, `notify-pipeline-done.sh`).
 -   `rules/`: Platform-specific test conventions (`android-uitest-conventions.md`, `ios-uitest-conventions.md`) and JSON output formatting rules.
 
@@ -40,28 +40,26 @@ The entire system is contained within the `.gemini/` directory. This image shows
 ### Core Commands
 -   `/agents:start <agent_name> "<prompt>"`: Queues a new task by creating a JSON file in the `tasks` directory.
 -   `/agents:run [task_id]`: Executes the oldest pending task (or a specific task) by launching the corresponding agent as a background process.
--   `/agents:run-all [agent_type] [--max-parallel N]`: Batch-executes all pending tasks with device pool limits. Automatically respects available device count for device-bound agents.
+-   `/agents:dispatch [agent_type] [--max-parallel N]`: Batch-executes all pending tasks with device pool limits. Automatically respects available device count for device-bound agents.
 -   `/agents:status [task_id]`: Reports the status of all tasks. It first reconciles any completed tasks by checking for `.done` files.
 -   `/agents:type`: Lists the available agent extensions.
 
 ### UITest Pipeline Commands
--   `/agents:pipeline [--skip-verify] [--skip-pr] [--suite <name>] [--class <name>...] [--pattern <glob>]`: Runs the full end-to-end UITest pipeline (discover → test → aggregate → verify → fix → PR).
--   `/agents:run-test [--variant <name>] [--module <name>] [--class <fqn>...] [--suite <name>] [--dry-run]`: Auto-detects Android/iOS projects in workspace and delegates to platform-specific test scripts. Supports multi-project selection.
+-   `/agents:pipeline [--skip-verify] [--skip-fix] [--skip-pr] [--class <name>...] [--variant <name>] [--module <name>] [--dry-run]`: Runs the full end-to-end UITest pipeline (test → verify → fix → **re-test** → PR). 큐 드레이닝 방식으로 디바이스 수만큼 병렬 검증.
+-   `/agents:run-test [--variant <name>] [--module <name>] [--class <fqn>...] [--dry-run]`: Auto-detects Android/iOS projects in workspace and delegates to platform-specific test scripts. Supports multi-project selection.
 -   `/agents:verify <uitest_results.json_path>`: Creates verifier-agent tasks to verify failed tests on real devices. Supports multi-device parallel verification with failure sharding.
 -   `/agents:fix <device_verification.json_path>`: Creates parallel coder-agent tasks (one per failing class) and launches them.
 -   `/agents:pr [project_path]`: Creates a pr-agent task to collect fix reports and open a GitHub PR.
 
 ### Utility Scripts
 -   `bin/device-pool.sh`: Device pool manager — `discover`, `acquire`, `release`, `status`, `cleanup`, `count`.
--   `bin/run-pipeline.sh`: Shell-based end-to-end pipeline orchestrator with `--skip-verify`, `--skip-pr`, `--suite`, `--class`, `--pattern`, `--dry-run` options.
--   `bin/create-test-tasks.py`: Parses test suite annotations and creates tester-agent task files without Gemini API calls. Supports `--suite`, `--class`, `--pattern` modes.
+-   `bin/run-pipeline.sh`: Shell-based end-to-end pipeline orchestrator with `--skip-verify`, `--skip-pr`, `--class`, `--pattern`, `--dry-run` options.
 -   `bin/run-test-android.sh`: Builds APK once, installs on all devices, and runs tests via `am instrument` with sharding. Bypasses Gemini API.
 -   `bin/run-test-ios.sh`: Runs iOS UI tests via `xcodebuild test` with device pool integration. Bypasses Gemini API.
 -   `bin/parse-am-instrument-results.py`: Parses `am instrument` shard logs into per-task `uitest_results.json` files.
--   `bin/aggregate-test-results.py`: Merges multiple `uitest_results.json` files into one aggregated file.
 -   `bin/merge-verification-results.py`: Consolidates multi-device verifier-agent results into a unified JSON. Falls back to aggregated results if verification is skipped.
 -   `bin/split-failures.py`: Round-robin distributes failed tests across N verification shards for parallel device verification.
--   `bin/run-agent-with-retry.sh`: Agent executor with model fallback and device pool integration (for verifier/coder/pr agents).
+-   `bin/run-agent-with-retry.sh`: Agent executor with model fallback and device pool integration. `verifier-agent`는 flash 모델 우선(동시 실행 안정성), 그 외 에이전트는 pro 모델 우선.
 -   `bin/reconcile-tasks.sh`: Detects failed tasks, resets to pending, cleans up stale device locks.
 -   `bin/reset-tasks.sh`: Task reset/cleanup utility with `--running`, `--agent`, `--clean`, `--dry-run` modes. Kills related processes and clears logs/sentinels/locks.
 -   `bin/parse-android-test-results.py`: Parses JUnit XML test results into structured JSON.
@@ -79,7 +77,7 @@ bin/run-pipeline.sh
 gemini /agents:pipeline
 
 # With options
-bin/run-pipeline.sh --skip-verify --suite SanitySuite
+bin/run-pipeline.sh --skip-verify --class com.fineapp.yogiyo.test.SanitySuite
 
 # Run specific test classes
 bin/run-pipeline.sh --class CartAndroidViewTest
@@ -96,45 +94,31 @@ bin/run-pipeline.sh --pattern "*Order*"
     # Output: Discovered: Android 2 (2 idle), iOS 0 (0 idle)
     ```
 
-2.  **Create Test Tasks**:
+2.  **Run Tests (device-limited parallelism, no Gemini API)**:
     ```bash
-    # Suite-based (default: SanitySuite)
-    python3 bin/create-test-tasks.py
-
-    # Specific suite
-    python3 bin/create-test-tasks.py --suite SanitySuite
-
-    # Specific test classes
-    python3 bin/create-test-tasks.py --class CartAndroidViewTest --class SearchAndroidViewTest
-
-    # Pattern-based
-    python3 bin/create-test-tasks.py --pattern "*Home*"
-    ```
-
-3.  **Run All Tests (device-limited parallelism, no Gemini API)**:
-    ```bash
-    # Batch execution (run-all internally uses run-test-android.sh for tester-agent tasks)
-    gemini /agents:run-all tester-agent
+    # Via Gemini CLI command (auto-detect platform)
+    gemini /agents:run-test --class CartAndroidViewTest --class SearchAndroidViewTest
 
     # Or direct execution:
     bin/run-test-android.sh --variant googleBeta --module yogiyo --class com.example.MyTest
     ```
 
-4.  **Aggregate Results**:
+3.  **Verify Failures on Real Device**:
     ```bash
-    python3 bin/aggregate-test-results.py
-    # Output: Total: 25, Passed: 22, Failed: 3
+    gemini /agents:verify .gemini/agents/logs/all_uitest_results.json
+    gemini /agents:dispatch verifier-agent
     ```
 
-5.  **Verify Failures on Real Device**:
+5.  **Fix Failures**:
     ```bash
-    gemini /agents:verify .gemini/agents/logs/aggregated_uitest_results.json
-    gemini /agents:run
+    gemini /agents:fix .gemini/agents/logs/pipeline_device_verification.json
+    gemini /agents:dispatch coder-agent
     ```
 
-6.  **Fix Failures**:
+6.  **Re-Test (수정 후 재검증)**:
     ```bash
-    gemini /agents:fix .gemini/agents/logs/task_xxx_device_verification.json
+    # 수정된 클래스만 테스트 재실행
+    bin/run-test-android.sh --variant googleBeta --module yogiyo --class <fixed_class_fqn>
     ```
 
 7.  **Create PR**:

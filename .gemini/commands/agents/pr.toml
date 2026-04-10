@@ -1,81 +1,78 @@
-description = "Creates a GitHub PR for completed UI test fixes: /agents:pr [project_path | task_id]"
+description = "완료된 UI 테스트 수정에 대한 GitHub PR을 생성합니다: /agents:pr [project_path | task_id]"
 prompt = """
-You are the Orchestrator's setup assistant. Your job is to create a pr-agent task that will collect all coder-agent fix reports and open a GitHub Pull Request.
+당신은 오케스트레이터의 **PR 태스크 생성기**입니다. coder-agent의 수정 보고서를 수집하여 GitHub Pull Request를 생성하는 pr-agent 태스크를 만들고 실행하는 것이 역할입니다.
 
-**CRITICAL: You MUST use the `run_shell_command` tool to execute all shell commands. Do NOT output commands as text only.**
+**중요: 반드시 `run_shell_command` 도구를 사용하여 모든 셸 명령을 실행해야 합니다.**
 
-**User Argument:**
-- Optional: `{{args}}` or `{{arg0}}`
-  - If a project path (e.g., `.gemini/agents/workspace/MyApp_Android`): use it as `projectPath`
-  - If a task ID (e.g., `task_123_fix_0`): look for `.gemini/agents/logs/<args>_fix_report.json`
-  - If empty: scan all recent fix reports and infer project path from the first one
+**사용자 인자:** `{{args}}` 또는 `{{arg0}}`
 
 ---
 
-**Instructions:**
+## 1단계 — 프로젝트 경로 및 수정 보고서 찾기
 
-**Step 1 — Find the project path and fix reports:**
+`{{args}}`가 비어 있는 경우:
+  - `run_shell_command`로 실행: `ls .gemini/agents/logs/*_fix_report.json 2>/dev/null || echo "NONE"`
+  - 첫 번째 수정 보고서를 읽어 `projectPath`를 추출합니다.
+  - 모든 `*_fix_report.json` 경로를 수집합니다.
 
-If `{{args}}` is empty:
-  - Use `run_shell_command` to execute: `ls .gemini/agents/logs/*_fix_report.json 2>/dev/null || echo "NONE"`
-  - Read the first fix report found to extract `projectPath`.
-  - Collect all `*_fix_report.json` paths as a space-separated list.
+`{{args}}`가 경로인 경우 (`/` 포함):
+  - 해당 경로를 `projectPath`로 직접 사용합니다.
+  - 수정 보고서: `ls .gemini/agents/logs/*_fix_report.json 2>/dev/null`
 
-If `{{args}}` looks like a path (contains `/`):
-  - Use it directly as the `projectPath`.
-  - Fix reports: `ls .gemini/agents/logs/*_fix_report.json 2>/dev/null`
+`{{args}}`가 태스크 ID인 경우 (`task_`로 시작):
+  - `.gemini/agents/logs/{{args}}_fix_report.json`을 확인합니다.
+  - 해당 파일을 읽어 `projectPath`를 추출합니다.
 
-If `{{args}}` looks like a task ID (starts with `task_`):
-  - Check: `.gemini/agents/logs/{{args}}_fix_report.json`
-  - Read it to extract `projectPath`.
+수정 보고서가 하나도 없으면 "수정 보고서를 찾을 수 없습니다. /agents:fix를 먼저 실행하세요." 출력 후 중단합니다.
 
-If no fix reports are found at all, output: "No fix reports found. Run /agents:fix first." and stop.
+## 2단계 — Task ID 생성
 
-**Step 2 — Generate Task ID:**
-Use `task_` + current Unix timestamp + `_pr` (e.g., `task_1740556800_pr`).
-Use a literal timestamp value. Do NOT use `$(...)` or backticks.
+`task_` + 현재 Unix timestamp + `_pr` (예: `task_1740556800_pr`).
+리터럴 timestamp 값을 사용합니다. `$(...)` 또는 백틱을 사용하지 마세요.
 
-**Step 3 — Build the pr-agent prompt:**
+## 3단계 — pr-agent 프롬프트 구성
+
 ```
 You are the pr-agent. Your Task ID is <TASK_ID>. Collect all fix reports from .gemini/agents/logs/*_fix_report.json. Project path: <PROJECT_PATH>. Base branch: main. Create a feature branch fix/uitest-<date>, push it, and open a GitHub PR. Follow your persona instructions and create .gemini/agents/tasks/<TASK_ID>.done when finished.
 ```
 
-**Step 4 — Write task and plan files:**
+## 4단계 — 태스크 및 Plan 파일 작성
 
-Use `run_shell_command` to execute:
-```
+`run_shell_command`로 실행:
+```shell
 echo '{"taskId":"<TASK_ID>","status":"pending","agent":"pr-agent","prompt":"<PROMPT>","planFile":".gemini/agents/plans/<TASK_ID>_plan.md","logFile":".gemini/agents/logs/<TASK_ID>.log","createdAt":"<ISO_TIMESTAMP>"}' > .gemini/agents/tasks/<TASK_ID>.json
 ```
 
-Use `run_shell_command` to execute:
-```
-echo '# Plan for pr-agent - Create GitHub PR for UI test fixes' > .gemini/agents/plans/<TASK_ID>_plan.md
+`run_shell_command`로 실행:
+```shell
+echo '# Plan for pr-agent - GitHub PR 생성' > .gemini/agents/plans/<TASK_ID>_plan.md
 ```
 
-**Step 5 — Update status and launch:**
+## 5단계 — 상태 업데이트 및 실행
 
-Update task status to "running" (rewrite the JSON with status="running").
+태스크 상태를 `"running"`으로 업데이트합니다 (JSON 파일 재작성).
 
-Use `run_shell_command` to launch the agent:
-```
+`run_shell_command`로 에이전트를 실행합니다:
+```shell
 bin/run-agent-with-retry.sh pr-agent <TASK_ID> .gemini/agents/logs/<TASK_ID>.log "<PROMPT>" &
 ```
 
-**Step 6 — Output confirmation:**
+## 6단계 — 확인 출력
+
 ```
-PR Agent started (Task: <TASK_ID>)
-Project: <projectPath>
-Monitor: /agents:status <TASK_ID>
-The PR URL will appear in: .gemini/agents/logs/<TASK_ID>.log
+PR Agent 시작됨 (Task: <TASK_ID>)
+프로젝트: <projectPath>
+모니터링: /agents:status <TASK_ID>
+PR URL: .gemini/agents/logs/<TASK_ID>.log 에서 확인 가능
 ```
 
 ---
 
-**CONSTRAINTS:**
-- You MUST NOT use shell command substitution `$(...)` or backticks in echo JSON strings.
-- Use single quotes `'...'` around JSON payloads in echo commands.
-- Avoid apostrophes `'` inside the prompt text — use backticks or rephrase.
-- You MUST call `run_shell_command` for every file write and agent launch.
+**제약 사항:**
+- 셸 명령 내에서 `$(...)` 또는 백틱 치환을 사용하지 마세요.
+- JSON 페이로드는 single-quote `'...'`로 감싸세요.
+- 프롬프트 텍스트 내에 apostrophe(`'`)를 사용하지 마세요.
+- 반드시 `run_shell_command`를 사용하여 모든 파일 쓰기와 에이전트 실행을 수행하세요.
 
-Now parse `{{args}}`, find fix reports, create the task, and launch pr-agent.
+이제 `{{args}}`를 파싱하고 태스크 생성 및 실행을 시작하세요.
 """

@@ -5,27 +5,39 @@
 # ==========================================
 usage() {
     echo "Usage: $0 [--variant <buildVariant>] [--module <moduleName>] [--class <testClass>]"
-    echo "  --variant   Gradle buildVariant (default: debug)"
-    echo "              예: debug, release, beta, stagingDebug, prodBeta"
-    echo "  --module    빌드 대상 모듈명 (default: app)"
-    echo "              예: app, feature:login, core:network"
-    echo "  --class     실행할 테스트 클래스 (FQCN). 여러 개 지정 가능 (미지정 시 전체 실행)"
-    echo "              예: --class com.fineapp.yogiyo.test.SanitySuite"
-    echo "              예: --class com.fineapp.yogiyo.test.LoginTest --class com.fineapp.yogiyo.test.HomeTest"
+    echo "  --variant        Gradle buildVariant (default: googleDebug)"
+    echo "                   예: googleDebug, googleRelease, googleBeta"
+    echo "  --module         빌드 대상 모듈명 (default: app)"
+    echo "                   예: app, feature:login, core:network"
+    echo "  --class          실행할 테스트 클래스 (FQCN). 여러 개 지정 가능 (미지정 시 전체 실행)"
+    echo "                   예: --class com.fineapp.yogiyo.test.SanitySuite"
+    echo "                   예: --class com.fineapp.yogiyo.test.LoginTest --class com.fineapp.yogiyo.test.HomeTest"
+    echo "  --output-dir     결과 JSON 출력 디렉토리 (기본: ./test_results)"
+    echo "  --project-path   결과 메타데이터용 프로젝트 경로 (기본: .)"
 }
+
+# ==========================================
+# 스크립트/레포 기준 경로 설정
+# ==========================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ==========================================
 # 인자 파싱
 # ==========================================
-BUILD_VARIANT="debug"
+BUILD_VARIANT="googleDebug"
 MODULE="app"
 TEST_CLASSES=()
+OUTPUT_DIR="$REPO_ROOT/.gemini/agents/logs"
+PROJECT_PATH="."
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --variant) BUILD_VARIANT="$2"; shift 2 ;;
-        --module)  MODULE="$2"; shift 2 ;;
-        --class)   TEST_CLASSES+=("$2"); shift 2 ;;
+        --variant)      BUILD_VARIANT="$2"; shift 2 ;;
+        --module)       MODULE="$2"; shift 2 ;;
+        --class)        TEST_CLASSES+=("$2"); shift 2 ;;
+        --output-dir)   OUTPUT_DIR="$2"; shift 2 ;;
+        --project-path) PROJECT_PATH="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -37,32 +49,41 @@ MODULE_PATH="${MODULE//:///}"
 # ==========================================
 # buildVariant에서 Gradle 태스크명 및 APK 경로 생성
 # ==========================================
-VARIANT_CAPITALIZED="$(echo "${BUILD_VARIANT:0:1}" | tr '[:lower:]' '[:upper:]')${BUILD_VARIANT:1}"
-GRADLE_ASSEMBLE_TASK=":${MODULE}:assemble${VARIANT_CAPITALIZED}"
-GRADLE_TEST_TASK=":${MODULE}:assemble${VARIANT_CAPITALIZED}AndroidTest"
 
-# buildType 분리 (debug, release, beta)
+# --- 앱 APK (BUILD_VARIANT 기반) ---
+APP_VARIANT_CAPITALIZED="$(echo "${BUILD_VARIANT:0:1}" | tr '[:lower:]' '[:upper:]')${BUILD_VARIANT:1}"
+GRADLE_ASSEMBLE_TASK=":${MODULE}:assemble${APP_VARIANT_CAPITALIZED}"
+
 if [[ "$BUILD_VARIANT" == *"Release" || "$BUILD_VARIANT" == *"release" ]]; then
-    BUILD_TYPE="release"
+    APP_BUILD_TYPE="release"
 elif [[ "$BUILD_VARIANT" == *"Beta" || "$BUILD_VARIANT" == *"beta" ]]; then
-    BUILD_TYPE="beta"
+    APP_BUILD_TYPE="beta"
 else
-    BUILD_TYPE="debug"
+    APP_BUILD_TYPE="debug"
 fi
 
-# flavor 추출 (buildType 부분 제거)
-FLAVOR="${BUILD_VARIANT%[Dd]ebug}"
-FLAVOR="${FLAVOR%[Rr]elease}"
-FLAVOR="${FLAVOR%[Bb]eta}"
-FLAVOR="$(echo "$FLAVOR" | tr '[:upper:]' '[:lower:]')"
+APP_FLAVOR="${BUILD_VARIANT%[Dd]ebug}"
+APP_FLAVOR="${APP_FLAVOR%[Rr]elease}"
+APP_FLAVOR="${APP_FLAVOR%[Bb]eta}"
+APP_FLAVOR="$(echo "$APP_FLAVOR" | tr '[:upper:]' '[:lower:]')"
 
-# APK 경로 생성
-if [ -z "$FLAVOR" ]; then
-    APK_SUBPATH="${BUILD_TYPE}"
-    APK_NAME="${MODULE_PATH##*/}-${BUILD_TYPE}"
+if [ -z "$APP_FLAVOR" ]; then
+    APP_APK_SUBPATH="${APP_BUILD_TYPE}"
+    APP_APK_NAME="${MODULE_PATH##*/}-${APP_BUILD_TYPE}"
 else
-    APK_SUBPATH="${FLAVOR}/${BUILD_TYPE}"
-    APK_NAME="${MODULE_PATH##*/}-${FLAVOR}-${BUILD_TYPE}"
+    APP_APK_SUBPATH="${APP_FLAVOR}/${APP_BUILD_TYPE}"
+    APP_APK_NAME="${MODULE_PATH##*/}-${APP_FLAVOR}-${APP_BUILD_TYPE}"
+fi
+
+# --- 테스트 APK (BUILD_VARIANT 기반, 앱과 동일) ---
+GRADLE_TEST_TASK=":${MODULE}:assemble${APP_VARIANT_CAPITALIZED}AndroidTest"
+
+if [ -z "$APP_FLAVOR" ]; then
+    TEST_APK_SUBPATH="${APP_BUILD_TYPE}"
+    TEST_APK_NAME="${MODULE_PATH##*/}-${APP_BUILD_TYPE}"
+else
+    TEST_APK_SUBPATH="${APP_FLAVOR}/${APP_BUILD_TYPE}"
+    TEST_APK_NAME="${MODULE_PATH##*/}-${APP_FLAVOR}-${APP_BUILD_TYPE}"
 fi
 
 # ==========================================
@@ -70,8 +91,8 @@ fi
 # ==========================================
 LOG_DIR="./test_results"
 
-APP_APK="./${MODULE_PATH}/build/outputs/apk/${APK_SUBPATH}/${APK_NAME}.apk"
-TEST_APK="./${MODULE_PATH}/build/outputs/apk/androidTest/${APK_SUBPATH}/${APK_NAME}-androidTest.apk"
+APP_APK="./${MODULE_PATH}/build/outputs/apk/${APP_APK_SUBPATH}/${APP_APK_NAME}.apk"
+TEST_APK="./${MODULE_PATH}/build/outputs/apk/androidTest/${TEST_APK_SUBPATH}/${TEST_APK_NAME}-androidTest.apk"
 
 mkdir -p "$LOG_DIR"
 
@@ -79,13 +100,13 @@ mkdir -p "$LOG_DIR"
 # 1. Gradlew를 이용한 APK 빌드
 # ==========================================
 echo "[INFO] Gradle 빌드를 시작합니다 (${GRADLE_ASSEMBLE_TASK}, ${GRADLE_TEST_TASK})..."
-echo "[INFO] Module: ${MODULE}, Build Variant: ${BUILD_VARIANT}"
+echo "[INFO] Module: ${MODULE}, Variant: ${BUILD_VARIANT}"
 
 # 혹시 모를 실행 권한 부여
 chmod +x ./gradlew
 
 # 앱과 테스트 앱을 한 번에 빌드합니다.
-./gradlew "$GRADLE_ASSEMBLE_TASK" "$GRADLE_TEST_TASK"
+REGRESSION=regression ./gradlew "$GRADLE_ASSEMBLE_TASK" "$GRADLE_TEST_TASK"
 
 # 빌드 명령어가 정상 종료되었는지 확인 ($?는 직전 명령어의 종료 코드)
 if [ $? -ne 0 ]; then
@@ -190,6 +211,7 @@ for i in "${!DEVICES[@]}"; do
     LOG_FILE="$LOG_DIR/shard_${SHARD_INDEX}_${DEVICE_ID}.log"
 
     echo "[INFO] [$DEVICE_ID] 테스트 시작 (Shard $SHARD_INDEX)..."
+    echo "[INFO] [$DEVICE_ID] 테스트 대상 $INSTRUMENT_CLASS_ARG"
 
     adb -s "$DEVICE_ID" shell am instrument -w \
         -e numShards "$NUM_SHARDS" \
@@ -205,14 +227,38 @@ done
 # ==========================================
 echo "[INFO] 모든 테스트가 백그라운드에서 실행 중입니다. 완료될 때까지 대기합니다..."
 
+# 주기적 heartbeat 출력 (30초 간격)
+HEARTBEAT_INTERVAL=30
+START_TIME=$SECONDS
+(
+    while true; do
+        sleep "$HEARTBEAT_INTERVAL"
+        ELAPSED=$(( SECONDS - START_TIME ))
+        MINUTES=$(( ELAPSED / 60 ))
+        SECS=$(( ELAPSED % 60 ))
+        # 아직 실행 중인 기기 목록 확인
+        RUNNING_DEVICES=""
+        for j in "${!PIDS[@]}"; do
+            if kill -0 "${PIDS[$j]}" 2>/dev/null; then
+                RUNNING_DEVICES+="${DEVICES[$j]} "
+            fi
+        done
+        if [ -z "$RUNNING_DEVICES" ]; then
+            break
+        fi
+        echo "[HEARTBEAT] 테스트 진행 중... (경과: ${MINUTES}분 ${SECS}초) | 실행 중인 기기: ${RUNNING_DEVICES}"
+    done
+) &
+HEARTBEAT_PID=$!
+
 FAILED=0
 for i in "${!PIDS[@]}"; do
     pid="${PIDS[$i]}"
     device="${DEVICES[$i]}"
-    
+
     wait "$pid"
     EXIT_CODE=$?
-    
+
     if [ $EXIT_CODE -ne 0 ]; then
         echo "[FAIL] [$device] 테스트 중 실패 또는 오류 발생 (Exit Code: $EXIT_CODE)"
         FAILED=$((FAILED + 1))
@@ -221,8 +267,24 @@ for i in "${!PIDS[@]}"; do
     fi
 done
 
+# heartbeat 프로세스 종료
+kill "$HEARTBEAT_PID" 2>/dev/null
+wait "$HEARTBEAT_PID" 2>/dev/null
+
 # ==========================================
-# 6. 최종 결과 리포트
+# 6. 결과 파싱 및 JSON 생성
+# ==========================================
+PARSE_ARGS="--shard-dir $LOG_DIR"
+PARSE_ARGS="$PARSE_ARGS --output-dir ${OUTPUT_DIR:-$LOG_DIR}"
+PARSE_ARGS="$PARSE_ARGS --project-path $PROJECT_PATH"
+
+echo "[INFO] 결과 파싱 중..."
+python3 "$SCRIPT_DIR/parse-am-instrument-results.py" $PARSE_ARGS || {
+    echo "[ERROR] 결과 파싱 실패"
+}
+
+# ==========================================
+# 7. 최종 결과 리포트
 # ==========================================
 echo "------------------------------------------"
 if [ $FAILED -eq 0 ]; then
@@ -230,6 +292,6 @@ if [ $FAILED -eq 0 ]; then
     exit 0
 else
     echo "[FINAL RESULT] 일부 테스트가 실패했습니다. (실패한 Shard 수: $FAILED)"
-    echo "[INFO] 자세한 내용은 $LOG_DIR 폴더의 로그를 확인하세요."
+    echo "[INFO] 자세한 내용은 ${OUTPUT_DIR:-$LOG_DIR} 폴더의 결과를 확인하세요."
     exit 1
 fi

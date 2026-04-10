@@ -1,6 +1,6 @@
-description = "테스트 결과에서 실패 클래스별 verifier-agent 태스크를 생성합니다: /agents:verify <uitest_results.json | shard_log_dir>"
+description = "테스트 결과 JSON에서 실패 클래스별 verifier-agent 태스크를 생성합니다: /agents:verify <uitest_results.json>"
 prompt = """
-당신은 오케스트레이터의 **검증 태스크 생성기**입니다. 테스트 결과 파일(JSON 또는 shard 로그 디렉토리)을 읽어 실패한 테스트 클래스별로 verifier-agent 태스크를 생성하는 것이 역할입니다.
+당신은 오케스트레이터의 **검증 태스크 생성기**입니다. 테스트 결과 JSON 파일을 읽어 실패한 테스트 클래스별로 verifier-agent 태스크를 생성하는 것이 역할입니다.
 
 **중요: 반드시 `run_shell_command` 도구를 사용하여 모든 셸 명령을 실행해야 합니다. 명령어를 텍스트로만 출력하지 마세요 — 반드시 실행하세요.**
 
@@ -8,33 +8,15 @@ prompt = """
 
 ---
 
-## 1단계 — 입력 판별, 플랫폼 감지 및 결과 파일 확보
+## 1단계 — JSON 파일 읽기 및 플랫폼 확인
 
-`{{args}}`에서 입력 경로를 파싱합니다. 입력 유형에 따라 처리 방식이 다릅니다:
+`{{args}}`에서 JSON 파일 경로를 파싱합니다.
 
-**A. JSON 파일인 경우** (경로가 `.json`으로 끝남):
 - `run_shell_command`로 `cat <path>` 실행하여 JSON 내용을 읽습니다.
 - 파일이 존재하지 않으면 "파일을 찾을 수 없습니다: <path>" 출력 후 중단합니다.
 
-**B. 디렉토리인 경우** (`.json`으로 끝나지 않음):
-- 먼저 shard 로그 파싱을 실행합니다:
-  ```shell
-  python3 bin/parse-am-instrument-results.py --shard-dir <path> --output-dir .gemini/agents/logs
-  ```
-- 파싱이 완료되면 생성된 결과 파일을 읽습니다:
-  - `.gemini/agents/logs/all_uitest_results.json` 파일이 생성되었는지 확인
-  - 또는 `.gemini/agents/logs/*_uitest_results.json` 파일들을 탐색
-  ```shell
-  cat .gemini/agents/logs/all_uitest_results.json
-  ```
-- shard 로그가 없거나 파싱에 실패하면 오류 메시지를 출력하고 중단합니다.
-
-**플랫폼 감지:**
-`.gemini/agents/workspace/` 하위 프로젝트 디렉터리를 스캔하여 플랫폼을 판별합니다:
-- `build.gradle`, `build.gradle.kts` 파일이 존재하면 → **Android**
-- `.xcodeproj`, `.xcworkspace` 파일이 존재하면 → **iOS**
-- JSON 결과 파일에 `platform` 필드가 있으면 해당 값을 우선 사용합니다.
-- 판별된 플랫폼 값(`Android` 또는 `iOS`)을 이후 프롬프트 생성 시 `<PLATFORM>`으로 사용합니다.
+**플랫폼 확인:**
+JSON 결과 파일의 `platform` 필드 값을 읽어 `<PLATFORM>`으로 사용합니다.
 
 ## 2단계 — 실패 클래스 및 테스트 메서드 추출
 
@@ -99,7 +81,7 @@ echo '# Plan for verifier-agent - <CLASS_NAME> 실패 테스트 검증' > .gemin
 | task_..._verify_1 | Android | kr.co.example.OtherTest | testX, testY | pending |
 
 그 후 다음 단계를 안내합니다:
-- 검증 태스크 실행: `/agents:run-all verifier-agent`
+- 검증 태스크 실행: `/agents:dispatch verifier-agent`
 - 상태 확인: `/agents:status`
 
 ---

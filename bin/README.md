@@ -8,12 +8,11 @@
 
 ### run-pipeline.sh
 
-E2E 파이프라인 오케스트레이터. 7단계 워크플로우(discover → create-tasks → run-tests → aggregate → verify → fix → PR)를 자동으로 실행합니다.
+E2E 파이프라인 오케스트레이터. 8단계 워크플로우(discover → create-tasks → run-tests → aggregate → verify → fix → **re-test** → PR)를 자동으로 실행합니다.
 
 ```bash
 bin/run-pipeline.sh                              # 전체 실행
 bin/run-pipeline.sh --skip-verify --skip-pr      # 검증/PR 스킵
-bin/run-pipeline.sh --suite SanitySuite          # 특정 스위트
 bin/run-pipeline.sh --class CartAndroidViewTest   # 특정 클래스
 bin/run-pipeline.sh --pattern "*Order*"           # 패턴 매칭
 bin/run-pipeline.sh --dry-run                     # 실행 계획만 확인
@@ -52,44 +51,14 @@ bin/run-test-ios.sh <task_id> <test_class_fqn> --project <project_path> --dry-ru
 
 ---
 
-## 태스크 생성
-
-### create-test-tasks.py
-
-테스트 스위트 어노테이션을 파싱하여 tester-agent 태스크 파일을 생성합니다. Gemini API 호출 없이 동작하며, `run-pipeline.sh` Stage 2에서 사용됩니다.
-
-```bash
-# Suite 기반 (기본: CriticalRTSuite)
-python3 bin/create-test-tasks.py
-python3 bin/create-test-tasks.py --suite SanitySuite
-
-# 특정 클래스 (복수 가능)
-python3 bin/create-test-tasks.py --class CartAndroidViewTest --class SearchAndroidViewTest
-
-# FQN 직접 지정
-python3 bin/create-test-tasks.py --class kr.co.yogiyo.presentation.checkout.CartAndroidViewTest
-
-# 패턴 매칭 (Suite 파일 및 헬퍼 클래스 자동 제외)
-python3 bin/create-test-tasks.py --pattern "*Home*"
-```
-
-**동작 규칙:**
-- **Suite 모드**: `@Suite.SuiteClasses(...)` 어노테이션에서 클래스 목록 추출, import 문 기반 FQN 해석
-- **Class 모드**: FQN은 그대로 사용, 단순 이름은 파일 검색 후 `package` 문에서 FQN 구성
-- **Pattern 모드**: 글로브 매칭 + `@Test`/`@RunWith` 어노테이션이 있는 실제 테스트 클래스만 필터
-- 모든 모드를 조합 가능 (union, 중복 자동 제거)
-
----
-
 ## 결과 파싱 및 집계
 
 ### parse-am-instrument-results.py
 
-`am instrument` 텍스트 출력을 파싱하여 태스크별 `uitest_results.json` 파일을 생성합니다. INSTRUMENTATION_STATUS 키와 상태 코드(0=pass, -1=error, -2=failure)를 해석합니다.
+`am instrument` 텍스트 출력을 파싱하여 `all_uitest_results.json` 파일을 생성합니다. INSTRUMENTATION_STATUS 키와 상태 코드(0=pass, -1=error, -2=failure)를 해석합니다.
 
 ```bash
-bin/parse-am-instrument-results.py --shard-dir <dir> --tasks-dir <dir> --output-dir <dir> \
-  --project-path <path> --module <module>
+bin/parse-am-instrument-results.py --shard-dir <dir> --output-dir <dir> --project-path <path>
 ```
 
 ### parse-android-test-results.py
@@ -108,16 +77,6 @@ bin/parse-android-test-results.py <xml_dir> -o <output.json> -p <project_path> [
 | `-o`, `--output` | 출력 JSON 파일 경로 |
 | `-p`, `--project-path` | 프로젝트 경로 (예: `.gemini/agents/workspace/Yogiyo_Android_for_ai`) |
 | `-m`, `--module` | Android 모듈명 (testFilePath용, 비우면 경로에서 자동 추론) |
-
-### aggregate-test-results.py
-
-다수의 `uitest_results.json` 파일을 하나의 집계 파일로 병합합니다.
-
-```bash
-python3 bin/aggregate-test-results.py
-```
-
----
 
 ## 검증 결과 처리
 
@@ -147,7 +106,8 @@ python3 bin/merge-verification-results.py --dir <logs_dir> --output <output.json
 에이전트를 백그라운드에서 실행하고, 모델 용량 제한 오류(MODEL_CAPACITY_EXHAUSTED, No Capacity available 등) 시 다른 모델로 자동 재시도합니다.
 
 **모델 선택 규칙:**
-- 모든 에이전트: pro (1차) → flash → 2.5-pro → 2.5-flash (순차 재시도)
+- `verifier-agent`: flash 우선 (2.5-flash → 3-flash → 2.5-pro) — 동시 실행이 많으므로 rate limit에 강한 flash 모델 우선
+- 그 외 에이전트: pro 우선 (3-pro → 2.5-pro → 3-flash → 2.5-flash)
 - 참고: 테스트 실행은 `run-test-android.sh`/`run-test-ios.sh`로 직접 수행되므로 Gemini API를 사용하지 않습니다.
 
 ```bash
@@ -178,7 +138,7 @@ bin/reconcile-tasks.sh --show-schedule  # 현재 cron 예약 확인
 ```bash
 bin/reset-tasks.sh                    # 기본 리셋
 bin/reset-tasks.sh --running          # running 상태 태스크만 리셋
-bin/reset-tasks.sh --agent tester-agent  # 특정 에이전트 태스크만 리셋
+bin/reset-tasks.sh --agent verifier-agent  # 특정 에이전트 태스크만 리셋
 bin/reset-tasks.sh --clean            # 전체 삭제 (태스크, 로그, 센티널, 잠금 모두)
 bin/reset-tasks.sh --dry-run          # 대상 확인만 (실제 삭제 없음)
 ```

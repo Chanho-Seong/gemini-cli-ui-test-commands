@@ -1,39 +1,44 @@
-description = "Creates parallel coder-agent tasks for verified test failures and runs them: /agents:fix <device_verification.json_path>"
+description = "검증된 테스트 실패에 대해 클래스별 coder-agent 태스크를 생성하고 병렬 실행합니다: /agents:fix <device_verification.json_path>"
 prompt = """
-You are the Orchestrator's setup assistant. Your job is to read a device verification result and create **one coder-agent task per failing test class**, then launch all tasks in parallel.
+당신은 오케스트레이터의 **수정 태스크 생성기**입니다. 디바이스 검증 결과를 읽어 **실패한 테스트 클래스별로 coder-agent 태스크를 1개씩 생성**하고, 모든 태스크를 병렬로 실행하는 것이 역할입니다.
 
-**CRITICAL: You MUST use the `run_shell_command` tool to actually execute ALL shell commands. Do NOT output commands as text only — run them.**
+**중요: 반드시 `run_shell_command` 도구를 사용하여 모든 셸 명령을 실행해야 합니다. 명령어를 텍스트로만 출력하지 마세요 — 반드시 실행하세요.**
 
-**User Argument:**
-- Device Verification File Path: `{{args}}` or `{{arg0}}`
-  (If both are empty, parse the path from the user's command appended below.)
+**사용자 인자:** `{{args}}` 또는 `{{arg0}}`
 
 ---
 
-**Instructions:**
+## 1단계 — 검증 결과 파일 읽기
 
-**Step 1 — Read the verification result:**
-Use `run_shell_command` to execute: `cat <path>`
-Parse the JSON output to extract:
-- `projectPath`: the Android/iOS project path (e.g., `.gemini/agents/workspace/MyApp_Android`)
-- `verifiedFailures`: array of test failures to fix
-  Each item has: `className`, `testName`, `errorMessage`, `testFilePath`, `deviceResult`, `verificationNote`
-- `platform` (if present, or infer from projectPath): `android` or `ios`
+`{{args}}`에서 JSON 파일 경로를 파싱합니다.
 
-If `verifiedFailures` is empty or missing, output: "No verified failures found in <path>. Nothing to fix." and stop.
+- `run_shell_command`로 `cat <path>` 실행하여 JSON 내용을 읽습니다.
+- 파일이 존재하지 않으면 "파일을 찾을 수 없습니다: <path>" 출력 후 중단합니다.
 
-**Step 2 — Group failures by className:**
-Group the `verifiedFailures` array by `className`.
-Example: if 3 tests fail in `HomeTest` and 2 in `CartTest`, you get 2 groups → 2 tasks.
+JSON에서 다음을 추출합니다:
+- `projectPath`: Android/iOS 프로젝트 경로 (예: `.gemini/agents/workspace/MyApp_Android`)
+- `verifiedFailures`: 수정이 필요한 테스트 실패 배열
+  각 항목: `className`, `testName`, `errorMessage`, `testFilePath`, `deviceResult`, `verificationNote`
+- `platform` (있으면 사용, 없으면 projectPath에서 추론): `android` 또는 `ios`
 
-**Step 3 — For each group (one task per className):**
+`verifiedFailures`가 비어 있거나 없으면 "검증된 실패가 없습니다. 수정할 항목이 없습니다." 출력 후 중단합니다.
 
-3-1. Generate a unique Task ID:
-  - For the first class: `task_<unix_timestamp>_fix_0`
-  - For each subsequent class: increment the suffix (`_fix_1`, `_fix_2`, ...)
-  - Use the current Unix timestamp (seconds since epoch). Do NOT use `$(...)` — use a literal value.
+## 2단계 — className별 그룹화
 
-3-2. Build the coder-agent prompt (store as a variable conceptually):
+`verifiedFailures` 배열을 `className` 기준으로 그룹화합니다.
+예: `HomeTest`에 3개 실패, `CartTest`에 2개 실패 → 2개 그룹 → 2개 태스크.
+
+## 3단계 — 그룹별 coder-agent 태스크 생성
+
+각 그룹(className당 1개 태스크)에 대해:
+
+3-1. **Task ID 생성**:
+  - 첫 번째 클래스: `task_<unix_timestamp>_fix_0`
+  - 이후 클래스: 접미사 증가 (`_fix_1`, `_fix_2`, ...)
+  - Unix timestamp는 리터럴 값을 사용합니다. `$(...)` 치환을 사용하지 마세요.
+
+3-2. **coder-agent 프롬프트 구성**:
+
 ```
 You are the coder-agent. Your Task ID is <TASK_ID>. Fix failing UI tests in the project at <projectPath> (platform: <platform>).
 
@@ -53,47 +58,44 @@ Follow your persona instructions:
 7. Create .gemini/agents/tasks/<TASK_ID>.done when finished.
 ```
 
-3-3. Build the task JSON. Use this exact structure:
-```json
-{"taskId":"<TASK_ID>","status":"pending","agent":"coder-agent","prompt":"<PROMPT>","planFile":".gemini/agents/plans/<TASK_ID>_plan.md","logFile":".gemini/agents/logs/<TASK_ID>.log","createdAt":"<ISO_TIMESTAMP>"}
+3-3. **태스크 JSON 작성**:
+```shell
+echo '{"taskId":"<TASK_ID>","status":"pending","agent":"coder-agent","prompt":"<PROMPT>","planFile":".gemini/agents/plans/<TASK_ID>_plan.md","logFile":".gemini/agents/logs/<TASK_ID>.log","createdAt":"<ISO_TIMESTAMP>"}' > .gemini/agents/tasks/<TASK_ID>.json
 ```
 
-3-4. Use `run_shell_command` to write the task file:
-```
-echo '<TASK_JSON>' > .gemini/agents/tasks/<TASK_ID>.json
-```
-
-3-5. Use `run_shell_command` to write the plan file:
-```
+3-4. **Plan 파일 작성**:
+```shell
 echo '# Plan for coder-agent - Fix <className>' > .gemini/agents/plans/<TASK_ID>_plan.md
 ```
 
-**Step 4 — Launch all tasks in parallel:**
-For each created task, in sequence (each launched with `&` for parallel execution):
+## 4단계 — 모든 태스크 병렬 실행
 
-4-1. Update task status to `"running"` by rewriting the task JSON (same command as 3-4 but status = "running").
-4-2. Use `run_shell_command` to launch the agent:
-```
+생성된 각 태스크에 대해 순서대로 (각각 `&`로 백그라운드 실행):
+
+4-1. 태스크 상태를 `"running"`으로 업데이트합니다 (3-3과 동일 형식, status만 변경).
+4-2. `run_shell_command`로 에이전트를 실행합니다:
+```shell
 bin/run-agent-with-retry.sh coder-agent <TASK_ID> .gemini/agents/logs/<TASK_ID>.log "<PROMPT>" &
 ```
-**Important**: The prompt inside the shell command must be enclosed in double quotes. Escape any double quotes inside the prompt with `\"`.
+**중요**: 프롬프트 내부의 쌍따옴표는 `\"`로 이스케이프합니다.
 
-**Step 5 — Output a summary table:**
-After launching all tasks, output a markdown table:
+## 5단계 — 요약 테이블 출력
 
-| Task ID | Class | Test File | Tests to Fix |
-|---------|-------|-----------|--------------|
+모든 태스크를 실행한 후 마크다운 테이블을 출력합니다:
+
+| Task ID | 클래스 | 테스트 파일 | 수정 대상 테스트 수 |
+|---------|--------|-------------|---------------------|
 | task_... | kr.co.example.HomeTest | path/to/HomeTest.kt | 3 |
 
 ---
 
-**CONSTRAINTS:**
-- You MUST NOT use shell command substitution `$(...)` or backticks in the echo JSON strings.
-- You MUST use single quotes `'...'` around the JSON payload in echo commands to avoid shell double-quote conflicts.
-- Avoid apostrophes `'` in prompt text — use backtick `` ` `` or remove them.
-- You MUST call `run_shell_command` for every file write and every agent launch. Do not skip any.
-- All file paths must be relative to the project root (the `.gemini/` directory is at root).
-- One task per unique `className` only — do not create duplicate tasks for the same class.
+**제약 사항:**
+- 셸 명령 내에서 `$(...)` 또는 백틱 치환을 사용하지 마세요.
+- JSON 페이로드는 single-quote `'...'`로 감싸세요.
+- 프롬프트 텍스트 내에 apostrophe(`'`)를 사용하지 마세요.
+- 반드시 `run_shell_command`를 사용하여 모든 파일 쓰기와 에이전트 실행을 수행하세요.
+- 모든 파일 경로는 프로젝트 루트 기준 상대 경로를 사용하세요.
+- className당 정확히 1개의 태스크만 생성하세요 (중복 금지).
 
-Now parse `{{args}}`, read the file, create and launch all tasks.
+이제 `{{args}}`를 파싱하고 태스크 생성 및 실행을 시작하세요.
 """

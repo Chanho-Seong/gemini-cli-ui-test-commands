@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 parse-am-instrument-results.py — am instrument 텍스트 출력을 파싱하여
-per-task uitest_results.json 파일을 생성합니다.
+all_uitest_results.json 파일을 생성합니다.
 
 사용법:
   python3 bin/parse-am-instrument-results.py [options]
 
 옵션:
   --shard-dir <dir>      shard 로그 디렉토리 (기본: ./test_results)
-  --tasks-dir <dir>      태스크 JSON 디렉토리 (기본: .gemini/agents/tasks)
   --output-dir <dir>     결과 JSON 출력 디렉토리 (기본: .gemini/agents/logs)
   --project-path <path>  프로젝트 상대 경로
-  --module <name>        모듈명 (기본: yogiyo)
 """
 
 import argparse
@@ -47,12 +45,15 @@ def parse_shard_log(filepath):
         print(f"Warning: Cannot read {filepath}: {e}", file=sys.stderr)
         return results
 
+    has_instrumentation_status = False
+
     for line in lines:
         line = line.strip()
 
         # INSTRUMENTATION_STATUS: key=value
         m = re.match(r"INSTRUMENTATION_STATUS:\s+(\w+)=(.*)", line)
         if m:
+            has_instrumentation_status = True
             key, value = m.group(1), m.group(2)
             if key == "class":
                 current["className"] = value
@@ -86,86 +87,119 @@ def parse_shard_log(filepath):
             current = {}
             continue
 
+    # INSTRUMENTATION_STATUS 형식이 없으면 스트림 형식으로 재시도
+    if not has_instrumentation_status and not results:
+        results = parse_stream_log(filepath)
+
     return results
 
 
-def load_tasks(tasks_dir):
-    """tester-agent 태스크 JSON 파일들을 로드합니다.
+def parse_stream_log(filepath):
+    """am instrument 스트림(텍스트) 출력에서 테스트 결과를 파싱합니다.
+
+    `-r` 플래그 없이 실행된 am instrument의 출력 형식:
+      kr.co.yogiyo.SomeTest:...     (클래스 헤더, 점은 통과한 테스트)
+      Error in testName(kr.co.yogiyo.SomeTest):
+      java.lang.AssertionError: ...
+      ...stack trace...
+      INSTRUMENTATION_RESULT: shortMsg=Process crashed.
+      INSTRUMENTATION_CODE: 0
+
+    중도 크래시가 발생해도 그때까지 수집된 결과를 반환합니다.
 
     Returns:
-        list[dict]: 태스크 정보 (taskId, testClassFqn, filePath)
+        list[dict]: 각 테스트 결과 (className, testName, status, errorMessage, stackTrace)
     """
-    tasks = []
-    pattern = os.path.join(tasks_dir, "task_*.json")
-    for filepath in sorted(glob.glob(pattern)):
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
+    results = []
 
-        if data.get("agent") != "tester-agent":
-            continue
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        print(f"Warning: Cannot read {filepath}: {e}", file=sys.stderr)
+        return results
 
-        task_id = data.get("taskId", os.path.basename(filepath).replace(".json", ""))
-        fqn = data.get("testClassFqn", "")
+    # 1. Error in 블록 파싱 — 실패한 테스트 추출
+    # 패턴: Error in TEST_NAME(fully.qualified.ClassName):
+    error_pattern = re.compile(
+        r"Error in ([^\(]+)\(([^\)]+)\):\s*\n(.*?)(?=\nError in |\n[a-zA-Z][\w.]+[A-Z]\w*(?:Test|Suite):|\nINSTRUMENTATION_|\Z)",
+        re.DOTALL,
+    )
+    failed_set = set()  # (className, testName) -> 중복 방지
 
-        # fallback: prompt에서 FQN 추출
-        if not fqn:
-            m = re.search(r"class\s+([\w.]+)", data.get("prompt", ""))
-            if m:
-                fqn = m.group(1)
+    for m in error_pattern.finditer(content):
+        test_name = m.group(1).strip()
+        class_name = m.group(2).strip()
+        error_body = m.group(3).strip()
 
-        if fqn:
-            tasks.append(
-                {"taskId": task_id, "testClassFqn": fqn, "filePath": filepath}
-            )
+        # 에러 메시지와 스택 트레이스 분리
+        # 스택 트레이스는 View Hierarchy 이후에 나올 수 있으므로 전체를 스캔
+        error_lines = error_body.split("\n")
+        error_message = ""
+        stack_trace_lines = []
+        for line in error_lines:
+            stripped = line.strip()
+            if stripped.startswith("at ") or stripped.startswith("Caused by:"):
+                stack_trace_lines.append(stripped)
+            elif stripped.startswith("SKIP["):
+                continue
+            # View Hierarchy, +>, |, 빈 줄 등은 무시
+            elif stripped.startswith(("View Hierarchy:", "The complete view hierarchy",
+                                      "+", "|", "No views in hierarchy")):
+                continue
+            elif not error_message and stripped:
+                error_message = stripped
 
-    return tasks
-
-
-def match_results_to_task(task_fqn, all_results):
-    """태스크의 testClassFqn에 해당하는 테스트 결과를 필터링합니다.
-
-    샤딩으로 인해 동일 클래스의 메소드가 여러 샤드에 분산될 수 있으므로
-    전체 결과에서 className이 일치하는 것을 모두 수집합니다.
-    """
-    matched = [r for r in all_results if r["className"] == task_fqn]
-    return matched
-
-
-def build_task_result(task_fqn, matched_results, project_path, module):
-    """per-task uitest_results.json 형식의 dict를 생성합니다."""
-    total = len(matched_results)
-    passed = sum(1 for r in matched_results if r["status"] == "passed")
-    failed_tests = []
-
-    for r in matched_results:
-        if r["status"] != "passed":
-            failed_tests.append(
+        key = (class_name, test_name)
+        if key not in failed_set:
+            failed_set.add(key)
+            results.append(
                 {
-                    "className": r["className"],
-                    "testName": r["testName"],
-                    "errorMessage": r.get("errorMessage", ""),
-                    "stackTrace": r.get("stackTrace", ""),
-                    "testFilePath": "",
+                    "className": class_name,
+                    "testName": test_name,
+                    "status": "failed",
+                    "errorMessage": error_message,
+                    "stackTrace": "\n".join(stack_trace_lines),
                 }
             )
 
-    return {
-        "platform": "android",
-        "projectPath": project_path or "",
-        "module": module or "",
-        "totalCount": total,
-        "passedCount": passed,
-        "failedCount": len(failed_tests),
-        "failedTests": failed_tests,
-    }
+    # 2. 클래스 헤더에서 통과한 테스트 수 추정
+    # 패턴: kr.co.yogiyo...ClassName:...  (점 하나당 통과 1건)
+    class_header_pattern = re.compile(
+        r"^([a-zA-Z][\w.]*\.[A-Z]\w*(?:Test|Suite)):([.\s]*?)$", re.MULTILINE
+    )
+
+    for m in class_header_pattern.finditer(content):
+        class_name = m.group(1).strip()
+        dots_section = m.group(2)
+        # 점(.) 개수 = 통과한 테스트 수
+        passed_count = dots_section.count(".")
+
+        for i in range(passed_count):
+            results.append(
+                {
+                    "className": class_name,
+                    "testName": f"passed_test_{i + 1}",
+                    "status": "passed",
+                    "errorMessage": "",
+                    "stackTrace": "",
+                }
+            )
+
+    # 3. 프로세스 크래시 감지
+    crash_match = re.search(
+        r"INSTRUMENTATION_RESULT:.*shortMsg=(.*)", content
+    )
+    if crash_match:
+        crash_msg = crash_match.group(1).strip()
+        print(f"  [WARN] Process crash detected: {crash_msg}", file=sys.stderr)
+
+    return results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parse am instrument shard logs into per-task JSON results"
+        description="Parse am instrument shard logs into a combined JSON result"
     )
     parser.add_argument(
         "--shard-dir",
@@ -173,20 +207,12 @@ def main():
         help="Directory containing shard_*.log files",
     )
     parser.add_argument(
-        "--tasks-dir",
-        default=".gemini/agents/tasks",
-        help="Directory containing task_*.json files",
-    )
-    parser.add_argument(
         "--output-dir",
         default=".gemini/agents/logs",
-        help="Directory to write per-task result JSON files",
+        help="Directory to write the result JSON file",
     )
     parser.add_argument(
         "--project-path", default="", help="Relative project path for result metadata"
-    )
-    parser.add_argument(
-        "--module", default="yogiyo", help="Module name for result metadata"
     )
     args = parser.parse_args()
 
@@ -211,16 +237,14 @@ def main():
     total_failed = total_tests - total_passed
     print(f"Total: {total_tests} tests, {total_passed} passed, {total_failed} failed")
 
-    # 2. 태스크 로드
-    tasks = load_tasks(args.tasks_dir)
-    if not tasks:
-        print(f"No tester-agent tasks found in {args.tasks_dir}", file=sys.stderr)
-        # 태스크 없이 전체 결과만 출력
-        all_result = build_task_result("", all_results, args.project_path, args.module)
-        all_result["totalCount"] = total_tests
-        all_result["passedCount"] = total_passed
-        all_result["failedCount"] = total_failed
-        all_result["failedTests"] = [
+    # 2. 전체 결과를 단일 JSON으로 출력
+    result = {
+        "platform": "android",
+        "projectPath": args.project_path or "",
+        "totalCount": total_tests,
+        "passedCount": total_passed,
+        "failedCount": total_failed,
+        "failedTests": [
             {
                 "className": r["className"],
                 "testName": r["testName"],
@@ -230,59 +254,15 @@ def main():
             }
             for r in all_results
             if r["status"] != "passed"
-        ]
+        ],
+        "error": "",
+    }
 
-        os.makedirs(args.output_dir, exist_ok=True)
-        out_path = os.path.join(args.output_dir, "all_uitest_results.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(all_result, f, indent=2, ensure_ascii=False)
-        print(f"Wrote combined results to: {out_path}")
-        return
-
-    # 3. 태스크별 결과 매칭 및 JSON 생성
     os.makedirs(args.output_dir, exist_ok=True)
-    written = 0
-
-    for task in tasks:
-        task_id = task["taskId"]
-        fqn = task["testClassFqn"]
-
-        matched = match_results_to_task(fqn, all_results)
-
-        if not matched:
-            # 결과가 없는 경우 (샤딩에서 제외되었거나 실행 안 됨)
-            result = {
-                "platform": "android",
-                "projectPath": args.project_path,
-                "module": args.module,
-                "totalCount": 0,
-                "passedCount": 0,
-                "failedCount": 1,
-                "failedTests": [
-                    {
-                        "className": fqn,
-                        "testName": "NO_RESULTS",
-                        "errorMessage": f"No test results found for {fqn} in shard logs",
-                        "stackTrace": "",
-                        "testFilePath": "",
-                    }
-                ],
-            }
-        else:
-            result = build_task_result(fqn, matched, args.project_path, args.module)
-
-        out_path = os.path.join(args.output_dir, f"{task_id}_uitest_results.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, indent=2, ensure_ascii=False)
-
-        status_str = "PASS" if result["failedCount"] == 0 else "FAIL"
-        print(
-            f"  {task_id}: {fqn} -> {result['totalCount']} tests, "
-            f"{result['failedCount']} failures [{status_str}]"
-        )
-        written += 1
-
-    print(f"\nWrote {written} per-task result file(s) to {args.output_dir}")
+    out_path = os.path.join(args.output_dir, "all_uitest_results.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+    print(f"Wrote combined results to: {out_path}")
 
 
 if __name__ == "__main__":

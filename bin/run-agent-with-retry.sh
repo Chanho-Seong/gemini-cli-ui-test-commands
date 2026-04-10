@@ -8,10 +8,10 @@
 #
 # 모델 선택 (최대 3회 재시도, 총 4회 시도):
 #   gemini-3-pro-preview -> gemini-2.5-pro -> gemini-3-flash-preview -> gemini-2.5-flash
-#   (tester-agent는 run-test-android.sh로 대체됨 — 이 스크립트는 verifier/coder/pr-agent용)
+#   테스트 실행은 run-test-android.sh/run-test-ios.sh로 직접 수행 — 이 스크립트는 verifier/coder/pr-agent용
 #
 # 디바이스 풀 연동 (--device-os 옵션):
-#   tester-agent, verifier-agent 실행 시 자동으로 디바이스를 acquire/release 합니다.
+#   verifier-agent 실행 시 자동으로 디바이스를 acquire/release 합니다.
 #   --device-os android|ios 를 지정하면 해당 OS의 디바이스를 점유합니다.
 #
 # 용량 오류 패턴: MODEL_CAPACITY_EXHAUSTED, No capacity available for model, No Capacity available
@@ -29,7 +29,7 @@ _LOG_SOURCE="retry"
 
 usage() {
   echo "Usage: $0 <agent> <task_id> <log_file> \"<prompt>\"" >&2
-  echo "  agent:   tester-agent, coder-agent, verifier-agent, reviewer-agent, etc." >&2
+  echo "  agent:   verifier-agent, coder-agent, pr-agent, etc." >&2
   echo "  task_id: e.g. task_123" >&2
   echo "  log_file: e.g. .gemini/agents/logs/task_123.log" >&2
   echo "  prompt:  Full prompt string for the agent" >&2
@@ -83,8 +83,13 @@ fi
 _LOG_FILE="$LOG_PATH"
 
 # 에이전트별 모델 순서 (최대 3회 재시도)
-# tester-agent는 run-test-android.sh로 대체되어 더 이상 Gemini API를 사용하지 않음
-MODELS=(gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview gemini-2.5-flash)
+# 테스트 실행은 run-test-android.sh/run-test-ios.sh로 직접 수행 (Gemini API 미사용)
+# verifier-agent는 동시 실행이 많으므로 flash 모델 우선 (rate limit에 강함)
+if [[ "$AGENT" == "verifier-agent" ]]; then
+  MODELS=(gemini-2.5-flash gemini-3-flash-preview gemini-2.5-pro)
+else
+  MODELS=(gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview gemini-2.5-flash)
+fi
 MAX_RETRIES=3
 
 log_contains_capacity_error() {

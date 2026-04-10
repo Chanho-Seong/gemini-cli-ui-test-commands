@@ -4,11 +4,11 @@
 #
 # 워크플로우:
 #   1. discover devices    → 디바이스 풀 초기화
-#   2. create-test-tasks   → tester-agent 태스크 생성
-#   3. run-all(tester)     → run-test-android.sh로 빌드 1회 + 디바이스 샤딩 실행
-#   4. aggregate           → 결과 집계
-#   5. verify              → verifier-agent 2차 검증 (디바이스별 병렬 실행)
-#   6. fix                 → coder-agent 수정
+#   2. run-tests           → run-test-android.sh / run-test-ios.sh로 플랫폼별 테스트 실행
+#   3. aggregate           → 결과 집계
+#   4. verify              → verifier-agent 2차 검증 (디바이스별 병렬 실행)
+#   5. fix                 → coder-agent 수정
+#   6. re-test             → 수정된 클래스만 재실행
 #   7. pr                  → PR 생성
 #
 # 사용법:
@@ -18,8 +18,7 @@
 #   --skip-verify    verifier 단계 스킵 (디바이스 없을 때)
 #   --skip-pr        PR 생성 스킵
 #   --dry-run        실행하지 않고 계획만 출력
-#   --suite <name>   테스트 스위트 지정 (기본: SanitySuite)
-#   --class <name>   특정 테스트 클래스 지정 (복수 가능)
+#   --class <name>   특정 테스트 클래스 지정 (복수 가능, TestSuite 클래스도 지정 가능)
 #   --pattern <glob> 테스트 클래스 파일명 패턴 (예: *Home*)
 #   --poll-interval <sec>  폴링 간격 (기본: 15초)
 #   --variant <name> 빌드 variant (기본: googleBeta)
@@ -37,7 +36,6 @@ LOGS_DIR="$PROJECT_ROOT/.gemini/agents/logs"
 SKIP_VERIFY=false
 SKIP_PR=false
 DRY_RUN=false
-SUITE_NAME="SanitySuite"
 TEST_CLASSES=""
 TEST_PATTERN=""
 POLL_INTERVAL=15
@@ -51,7 +49,6 @@ while [[ $# -gt 0 ]]; do
     --skip-verify)  SKIP_VERIFY=true; shift ;;
     --skip-pr)      SKIP_PR=true; shift ;;
     --dry-run)      DRY_RUN=true; shift ;;
-    --suite)        SUITE_NAME="$2"; shift 2 ;;
     --class)        TEST_CLASSES="$TEST_CLASSES --class $2"; shift 2 ;;
     --pattern)      TEST_PATTERN="--pattern $2"; shift 2 ;;
     --poll-interval) POLL_INTERVAL="$2"; shift 2 ;;
@@ -82,7 +79,6 @@ summary_header() {
   cat >> "$SUMMARY_FILE" <<EOF
 ========================================
 Pipeline Run: $RUN_ID
-Suite: $SUITE_NAME
 Started: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 Options: skip-verify=$SKIP_VERIFY, skip-pr=$SKIP_PR
 ========================================
@@ -244,170 +240,138 @@ stage_discover() {
   IOS_DEVICE_COUNT="$ios_count"
 }
 
-stage_test_planning() {
-  log_info "=== Stage 2: Test Planning ==="
-  log_info "Creating tester-agent tasks for suite: $SUITE_NAME"
-
-  # Build create-test-tasks.py arguments: --class/--pattern override --suite
-  local plan_args="--suite $SUITE_NAME"
-  if [[ -n "$TEST_CLASSES" ]]; then
-    plan_args="$TEST_CLASSES"
-  fi
-  if [[ -n "$TEST_PATTERN" ]]; then
-    plan_args="$TEST_PATTERN"
-  fi
-
-  # Gemini API 호출 없이 Python 스크립트로 직접 태스크 생성
-  cd "$PROJECT_ROOT"
-  python3 "$SCRIPT_DIR/create-test-tasks.py" $plan_args 2>&1 | tee "$RUN_DIR/pipeline_test_planning.log" || true
-
-  local task_count
-  task_count="$(count_tasks tester-agent pending)"
-  log_info "Created $task_count tester-agent tasks"
-
-  if [[ "$task_count" -eq 0 ]]; then
-    log_error "No tester-agent tasks created. Check create-test-tasks.py output."
-    return 1
-  fi
-}
-
 stage_run_tests() {
-  log_info "=== Stage 3: Run Tests (Direct — build once, shard across devices) ==="
+  log_info "=== Stage 2: Run Tests (Platform-aware — Android / iOS) ==="
 
-  # 1. 모든 tester-agent 태스크에서 testClassFqn 수집
+  # 1. --class / --pattern 인자로 class_args 구성
   local class_args=()
-  local task_ids=()
-  local task_files_map=()
 
-  for task_file in "$TASKS_DIR"/task_*.json; do
-    [[ -f "$task_file" ]] || continue
-
-    local agent status task_id test_class_fqn
-    agent="$(python3 -c "import json; print(json.load(open('$task_file')).get('agent',''))" 2>/dev/null || echo "")"
-    status="$(python3 -c "import json; print(json.load(open('$task_file')).get('status',''))" 2>/dev/null || echo "")"
-    [[ "$agent" == "tester-agent" && "$status" == "pending" ]] || continue
-
-    task_id="$(python3 -c "import json; print(json.load(open('$task_file')).get('taskId',''))" 2>/dev/null)"
-
-    # testClassFqn 필드 우선, 없으면 prompt에서 추출
-    test_class_fqn="$(python3 -c "
-import json, re
-d = json.load(open('$task_file'))
-fqn = d.get('testClassFqn', '')
-if not fqn:
-    m = re.search(r'class\s+([\w.]+)', d.get('prompt', ''))
-    fqn = m.group(1) if m else ''
-print(fqn)
-" 2>/dev/null)"
-
-    if [[ -z "$test_class_fqn" ]]; then
-      log_error "Cannot extract test class FQN from task $task_id, skipping"
-      continue
-    fi
-
-    class_args+=("--class" "$test_class_fqn")
-    task_ids+=("$task_id")
-    task_files_map+=("$task_file")
-
-    # 상태를 running으로 업데이트
-    python3 -c "
-import json
-with open('$task_file') as f: d = json.load(f)
-d['status'] = 'running'
-with open('$task_file', 'w') as f: json.dump(d, f, ensure_ascii=False)
-"
-  done
-
-  if [[ ${#class_args[@]} -eq 0 ]]; then
-    log_error "No test classes found in tester-agent tasks"
-    return 1
+  if [[ -n "$TEST_CLASSES" ]]; then
+    # TEST_CLASSES는 "--class X --class Y" 형식
+    eval "local args=($TEST_CLASSES)"
+    class_args+=("${args[@]}")
   fi
 
-  log_info "Collected ${#task_ids[@]} test class(es) for execution"
-  log_info "Build variant: $BUILD_VARIANT, Module: $MODULE"
+  # --pattern은 run-test-android.sh가 직접 지원하지 않으므로,
+  # 패턴이 지정된 경우 워크스페이스에서 매칭되는 테스트 클래스를 검색
+  if [[ -n "$TEST_PATTERN" ]]; then
+    local pattern_val="${TEST_PATTERN#--pattern }"
+    log_info "Resolving pattern: $pattern_val"
+    local workspace_dir="$PROJECT_ROOT/.gemini/agents/workspace"
+    while IFS= read -r fqn; do
+      [[ -n "$fqn" ]] && class_args+=("--class" "$fqn")
+    done < <(python3 -c "
+import os, re
+pattern = '$pattern_val'
+workspace = '$workspace_dir'
+for root, dirs, files in os.walk(workspace):
+    if 'androidTest' not in root:
+        continue
+    for f in files:
+        if not (f.endswith('.kt') or f.endswith('.java')):
+            continue
+        name = os.path.splitext(f)[0]
+        import fnmatch
+        if not fnmatch.fnmatch(name, pattern):
+            continue
+        path = os.path.join(root, f)
+        with open(path) as fh:
+            content = fh.read()
+        if '@Test' not in content and '@RunWith' not in content:
+            continue
+        pkg = ''
+        for line in content.splitlines():
+            if line.strip().startswith('package '):
+                pkg = line.strip().replace('package ', '').rstrip(';').strip()
+                break
+        if pkg:
+            print(f'{pkg}.{name}')
+" 2>/dev/null)
+    log_info "Pattern resolved to ${#class_args[@]} class args"
+  fi
 
-  # 2. 워크스페이스 프로젝트 디렉토리 탐색
-  local workspace_project=""
+  # 2. 워크스페이스 프로젝트 디렉토리 탐색 (Android / iOS 자동 식별)
+  local android_project=""
+  local ios_project=""
+
   for dir in "$PROJECT_ROOT/.gemini/agents/workspace"/*/; do
+    [[ -d "$dir" ]] || continue
     if [[ -f "$dir/build.gradle" || -f "$dir/build.gradle.kts" ]]; then
-      workspace_project="$dir"
-      break
+      android_project="$dir"
+    fi
+    if ls "$dir"/*.xcworkspace 2>/dev/null | head -1 > /dev/null || \
+       ls "$dir"/*.xcodeproj 2>/dev/null | head -1 > /dev/null; then
+      ios_project="$dir"
     fi
   done
 
-  if [[ -z "$workspace_project" ]]; then
-    log_error "No Android project found in .gemini/agents/workspace/"
+  local ran_any=false
+
+  # 3. Android 테스트 실행
+  if [[ -n "$android_project" ]]; then
+    android_project="${android_project%/}"
+    local android_relative="${android_project#$PROJECT_ROOT/}"
+
+    log_info "Android project: $android_relative"
+    log_info "Build variant: $BUILD_VARIANT, Module: $MODULE"
+
+    local android_exit_code=0
+    (
+      cd "$android_project"
+      "$SCRIPT_DIR/run-test-android.sh" \
+        --variant "$BUILD_VARIANT" \
+        --module "$MODULE" \
+        --output-dir "${RUN_DIR:-$LOGS_DIR}" \
+        --project-path "$android_relative" \
+        "${class_args[@]}"
+    ) >> "$RUN_DIR/run-test-android.log" 2>&1 || android_exit_code=$?
+
+    log_info "run-test-android.sh exited with code: $android_exit_code"
+    ran_any=true
+  fi
+
+  # 4. iOS 테스트 실행
+  if [[ -n "$ios_project" && "${IOS_DEVICE_COUNT:-0}" -gt 0 ]]; then
+    ios_project="${ios_project%/}"
+    local ios_relative="${ios_project#$PROJECT_ROOT/}"
+
+    log_info "iOS project: $ios_relative"
+
+    local ios_exit_code=0
+    "$SCRIPT_DIR/run-test-ios.sh" \
+      --project "$ios_project" \
+      --output-dir "${RUN_DIR:-$LOGS_DIR}" \
+      --project-path "$ios_relative" \
+      "${class_args[@]}" \
+      >> "$RUN_DIR/run-test-ios.log" 2>&1 || ios_exit_code=$?
+
+    log_info "run-test-ios.sh exited with code: $ios_exit_code"
+    ran_any=true
+  fi
+
+  if [[ "$ran_any" == "false" ]]; then
+    log_error "No project found in .gemini/agents/workspace/"
     return 1
   fi
-  workspace_project="${workspace_project%/}"
-  local relative_project="${workspace_project#$PROJECT_ROOT/}"
 
-  log_info "Project: $relative_project"
-
-  # 3. run-test-android.sh 단일 호출 (빌드 1회 + 디바이스 샤딩)
-  local test_exit_code=0
-  (
-    cd "$workspace_project"
-    "$SCRIPT_DIR/run-test-android.sh" \
-      --variant "$BUILD_VARIANT" \
-      --module "$MODULE" \
-      "${class_args[@]}"
-  ) >> "$RUN_DIR/run-test-android.log" 2>&1 || test_exit_code=$?
-
-  log_info "run-test-android.sh exited with code: $test_exit_code"
-
-  # 4. shard 결과를 per-task JSON으로 파싱
-  local shard_dir="$workspace_project/test_results"
-  python3 "$SCRIPT_DIR/parse-am-instrument-results.py" \
-    --shard-dir "$shard_dir" \
-    --tasks-dir "$TASKS_DIR" \
-    --output-dir "${RUN_DIR:-$LOGS_DIR}" \
-    --project-path "$relative_project" \
-    --module "$MODULE" \
-    >> "$RUN_DIR/parse-results.log" 2>&1 || {
-      log_error "Failed to parse am instrument results"
-    }
-
-  # 5. 태스크별 .done 생성 및 status 업데이트
-  for i in "${!task_ids[@]}"; do
-    local tid="${task_ids[$i]}"
-    local tfile="${task_files_map[$i]}"
-
-    touch "$TASKS_DIR/${tid}.done"
-
-    # 결과 JSON에서 failedCount 확인하여 status 결정
-    local result_file="${RUN_DIR:-$LOGS_DIR}/${tid}_uitest_results.json"
-    local new_status="complete"
-    if [[ -f "$result_file" ]]; then
-      local fc
-      fc="$(python3 -c "import json; print(json.load(open('$result_file')).get('failedCount',0))" 2>/dev/null || echo 0)"
-      [[ "$fc" -gt 0 ]] && new_status="failed"
-    fi
-
-    python3 -c "
-import json
-with open('$tfile') as f: d = json.load(f)
-d['status'] = '$new_status'
-with open('$tfile', 'w') as f: json.dump(d, f, ensure_ascii=False)
-" 2>/dev/null || true
-  done
-
-  log_info "All ${#task_ids[@]} test tasks completed (run-test-android.sh exit: $test_exit_code)"
+  log_info "Test execution complete"
 }
 
 stage_aggregate() {
-  log_info "=== Stage 4: Aggregate Results ==="
-  python3 "$SCRIPT_DIR/aggregate-test-results.py" \
-    -d "${RUN_DIR:-$LOGS_DIR}" \
-    -o "$RUN_DIR/aggregated_uitest_results.json"
+  log_info "=== Stage 3: Check Results ==="
 
-  AGGREGATED_FILE="$RUN_DIR/aggregated_uitest_results.json"
+  AGGREGATED_FILE="$RUN_DIR/all_uitest_results.json"
+
+  if [[ ! -f "$AGGREGATED_FILE" ]]; then
+    log_error "Result file not found: $AGGREGATED_FILE"
+    return 1
+  fi
 
   # Check if there are failures
   local failed_count
   failed_count="$(python3 -c "import json; print(json.load(open('$AGGREGATED_FILE')).get('failedCount', 0))" 2>/dev/null || echo 0)"
 
-  log_info "Aggregated: $failed_count failures"
+  log_info "Result: $failed_count failures"
 
   if [[ "$failed_count" -eq 0 ]]; then
     log_info "No failures found. Pipeline complete (no fixes needed)."
@@ -416,7 +380,7 @@ stage_aggregate() {
 }
 
 stage_verify() {
-  log_info "=== Stage 5: Device Verification (Parallel) ==="
+  log_info "=== Stage 4: Device Verification (Parallel) ==="
 
   if [[ "$SKIP_VERIFY" == "true" ]]; then
     log_info "Verify stage skipped. Passing all failures to coder-agent."
@@ -528,7 +492,7 @@ with open('$TASKS_DIR/${task_id}.json', 'w') as f:
 }
 
 stage_fix() {
-  log_info "=== Stage 6: Fix Failures ==="
+  log_info "=== Stage 5: Fix Failures ==="
 
   cd "$PROJECT_ROOT"
 
@@ -618,6 +582,7 @@ for i, (cls, tests) in enumerate(by_class.items()):
 
 stage_pr() {
   log_info "=== Stage 7: Create PR ==="
+  # (Stage 6: Re-test는 pipeline.toml에서 처리)
 
   if [[ "$SKIP_PR" == "true" ]]; then
     log_info "PR stage skipped."
@@ -676,14 +641,11 @@ main() {
   if [[ "$DRY_RUN" == "true" ]]; then
     log_info "[DRY RUN] Would execute:"
     log_info "  1. device-pool.sh discover"
-    local dry_plan_args="--suite $SUITE_NAME"
-    [[ -n "$TEST_CLASSES" ]] && dry_plan_args="$TEST_CLASSES"
-    [[ -n "$TEST_PATTERN" ]] && dry_plan_args="$TEST_PATTERN"
-    log_info "  2. create-test-tasks.py $dry_plan_args"
-    log_info "  3. run-test-android.sh --variant $BUILD_VARIANT --module $MODULE (build once, shard across devices)"
-    log_info "  4. aggregate-test-results.py"
-    log_info "  5. /agents:verify (device-limited)"
-    log_info "  6. /agents:fix"
+    log_info "  2. run-test-android.sh --variant $BUILD_VARIANT --module $MODULE / run-test-ios.sh (platform-aware)"
+    log_info "  3. check all_uitest_results.json"
+    log_info "  4. /agents:verify (device-limited, queue draining)"
+    log_info "  5. /agents:fix"
+    log_info "  6. re-test (수정된 클래스만 재실행)"
     log_info "  7. /agents:pr"
     exit 0
   fi
@@ -702,7 +664,6 @@ main() {
 
   log_info "=========================================="
   log_info "UITest Pipeline Started"
-  log_info "Suite: $SUITE_NAME"
   log_info "Skip verify: $SKIP_VERIFY"
   log_info "Skip PR: $SKIP_PR"
   log_info "Run directory: $RUN_DIR"
@@ -715,18 +676,12 @@ main() {
   stage_discover
   stage_end "discover" "ok"
 
-  # Stage 2: Test Planning
-  stage_start "test-planning"
-  stage_test_planning
-  stage_end "test-planning" "ok"
-
-  # Stage 3: Run Tests
+  # Stage 2: Run Tests (directly, no tester-agent tasks)
   stage_start "run-tests"
   stage_run_tests
-  write_task_outcomes "tester-agent"
   stage_end "run-tests" "ok"
 
-  # Stage 4: Aggregate (returns 1 if no failures)
+  # Stage 3: Aggregate (returns 1 if no failures)
   stage_start "aggregate"
   if ! stage_aggregate; then
     stage_end "aggregate" "no-failures"
@@ -736,7 +691,7 @@ main() {
   fi
   stage_end "aggregate" "ok"
 
-  # Stage 5: Verify (returns 1 if all were emulator-only)
+  # Stage 4: Verify (returns 1 if all were emulator-only)
   stage_start "verify"
   if ! stage_verify; then
     stage_end "verify" "no-real-failures"
@@ -747,11 +702,13 @@ main() {
   write_task_outcomes "verifier-agent"
   stage_end "verify" "ok"
 
-  # Stage 6: Fix
+  # Stage 5: Fix
   stage_start "fix"
   stage_fix
   write_task_outcomes "coder-agent"
   stage_end "fix" "ok"
+
+  # Stage 6: Re-test — pipeline.toml에서 처리 (run-pipeline.sh에서는 미구현)
 
   # Stage 7: PR
   stage_start "pr"

@@ -1,4 +1,4 @@
-description = "UITest 전체 파이프라인 실행: /agents:pipeline [--skip-fix] [--skip-pr] [--skip-verify] [--suite <name>] [--class <fqn>...] [--variant <name>] [--module <name>]"
+description = "UITest 전체 파이프라인 실행: /agents:pipeline [--skip-fix] [--skip-pr] [--skip-verify] [--class <fqn>...] [--variant <name>] [--module <name>]"
 prompt = """
 당신은 마스터 오케스트레이터의 **파이프라인 컨트롤러**입니다. UITest 파이프라인을 단계별로 순차 실행하는 것이 당신의 역할입니다.
 
@@ -15,8 +15,7 @@ prompt = """
 - `--skip-fix`: 코드 수정(fix) 단계를 건너뜁니다
 - `--skip-pr`: PR 생성 단계를 건너뜁니다
 - `--skip-verify`: 디바이스 검증 단계를 건너뜁니다 (검증 없이 바로 fix로 진행)
-- `--suite <name>`: 테스트 스위트 이름 (기본값: SanitySuite)
-- `--class <fqn>`: 실행할 테스트 클래스 FQCN (여러 개 지정 가능)
+- `--class <fqn>`: 실행할 테스트 클래스 FQCN (여러 개 지정 가능). TestSuite 클래스도 직접 지정 가능
 - `--variant <name>`: Android 빌드 variant (기본값: googleBeta)
 - `--module <name>`: Android 모듈명 (기본값: yogiyo)
 - `--dry-run`: 실행하지 않고 계획만 출력
@@ -59,10 +58,11 @@ ls .gemini/agents/workspace/<project_name>/*.xcodeproj 2>/dev/null
 플랫폼: <PLATFORM>
 프로젝트: <PROJECT_PATH>
 1. 테스트 실행: <플랫폼별 스크립트>
-2. 검증 태스크 생성: /agents:verify <결과 파일>  (skip-verify 시 생략)
-3. 검증 실행: /agents:run-all verifier-agent  (skip-verify 시 생략)
-4. 코드 수정: /agents:fix <검증 결과>  (skip-fix 시 생략)
-5. PR 생성: /agents:pr  (skip-pr 시 생략)
+2. 검증 태스크 생성  (skip-verify 시 생략)
+3. 검증 실행 (큐 드레이닝 방식, 디바이스 수 제한)  (skip-verify 시 생략)
+4. 코드 수정  (skip-fix 시 생략)
+5. 재검증: 수정된 클래스만 테스트 재실행  (skip-fix 시 생략)
+6. PR 생성  (skip-pr 시 생략)
 ```
 
 ---
@@ -73,38 +73,24 @@ ls .gemini/agents/workspace/<project_name>/*.xcodeproj 2>/dev/null
 
 ### Android 프로젝트인 경우:
 
-1. `--suite` 옵션이 지정된 경우, 프로젝트 소스에서 스위트 파일을 찾아 테스트 클래스 목록을 추출합니다:
-   - `*<suite_name>*.kt` 또는 `*<suite_name>*.java` 파일을 `androidTest/` 디렉토리에서 검색
-   - `@Suite.SuiteClasses(...)` 어노테이션 내의 클래스 목록을 파싱
-   - 추출된 각 FQCN을 `--class` 옵션으로 변환
+```shell
+cd .gemini/agents/workspace/<project_name> && ../../../../bin/run-test-android.sh --output-dir ../../../../.gemini/agents/logs --variant <variant> --module <module> [--class <fqn1> --class <fqn2> ...]
+```
 
-2. `run-test-android.sh`를 실행합니다:
-   ```shell
-   cd .gemini/agents/workspace/<project_name> && ../../../../bin/run-test-android.sh --variant <variant> --module <module> [--class <fqn1> --class <fqn2> ...]
-   ```
-
-3. 실행 결과를 파싱합니다:
-   ```shell
-   python3 bin/parse-am-instrument-results.py --shard-dir .gemini/agents/workspace/<project_name>/test_results --output-dir .gemini/agents/logs
-   ```
+스크립트가 내부적으로 APK 빌드, 디바이스 탐지, 샤딩, 결과 파싱을 자동 처리합니다.
 
 ### iOS 프로젝트인 경우:
 
-1. `--suite` 옵션이 지정된 경우, 프로젝트에서 해당 스위트와 관련된 테스트 타겟 또는 스킴을 검색합니다.
+```shell
+bin/run-test-ios.sh --project .gemini/agents/workspace/<project_name> --output-dir .gemini/agents/logs [--class <fqn1> --class <fqn2> ...]
+```
 
-2. `--class`가 여러 개인 경우 각각에 대해 `run-test-ios.sh`를 실행합니다:
-   ```shell
-   bin/run-test-ios.sh task_<unix_timestamp>_test_<index> <test_class_fqn> --project .gemini/agents/workspace/<project_name>
-   ```
-   - `--class`와 `--suite` 모두 미지정 시, 전체 테스트를 실행합니다.
-   - iOS는 클래스별로 별도의 task_id를 부여하여 개별 실행합니다.
-   - `run-test-ios.sh`가 내부적으로 디바이스 풀 관리, xcodebuild 실행, xcresulttool 파싱, 결과 JSON 생성을 자동 처리합니다.
+스크립트가 내부적으로 디바이스 풀 관리, xcodebuild 실행, xcresulttool 파싱, 결과 JSON 생성을 자동 처리합니다.
 
 ### 공통:
 
 테스트 실행이 완료되면, 결과 파일 경로를 기록합니다:
-- Android: `.gemini/agents/logs/all_uitest_results.json` 또는 생성된 결과 JSON
-- iOS: `.gemini/agents/logs/<task_id>_uitest_results.json` (여러 개일 수 있음)
+- `.gemini/agents/logs/all_uitest_results.json` 또는 생성된 결과 JSON
 
 **결과 확인:** 실패한 테스트가 없으면 "모든 테스트가 통과했습니다. 파이프라인을 종료합니다." 출력 후 종료합니다.
 
@@ -129,31 +115,51 @@ ls .gemini/agents/workspace/<project_name>/*.xcodeproj 2>/dev/null
 
 ---
 
-## 4단계 — 검증 실행 (run-all verifier-agent)
+## 4단계 — 검증 실행 (큐 드레이닝 방식)
 
 **`--skip-verify` 옵션이 지정된 경우 이 단계를 건너뜁니다.**
 
-1. 디바이스를 탐색합니다:
-   ```shell
-   bin/device-pool.sh discover
-   ```
-   감지된 플랫폼에 맞는 디바이스 수를 조회합니다:
-   - Android: `bin/device-pool.sh count android`
-   - iOS: `bin/device-pool.sh count ios`
+### 4-1. 디바이스 탐색 및 병렬 수 결정
 
-2. `.gemini/agents/tasks/` 디렉토리에서 `"status": "pending"`, `"agent": "verifier-agent"`인 태스크를 찾습니다.
+```shell
+bin/device-pool.sh discover
+```
 
-3. 해당 플랫폼의 디바이스 수에 맞춰 병렬로 실행합니다:
+감지된 플랫폼에 맞는 유휴 디바이스 수를 조회합니다:
+- Android: `bin/device-pool.sh count android`
+- iOS: `bin/device-pool.sh count ios`
+
+`.gemini/agents/tasks/` 디렉토리에서 `"status": "pending"`, `"agent": "verifier-agent"`인 태스크를 찾습니다.
+
+최대 병렬 수를 결정합니다:
+- `max_parallel = min(유휴_디바이스_수, 대기_태스크_수)`
+
+### 4-2. 큐 드레이닝 방식으로 병렬 실행
+
+**중요: 모든 태스크를 한꺼번에 실행하지 마세요.** `max_parallel` 개만 먼저 실행하고, 완료될 때마다 다음 태스크를 실행합니다.
+
+1. 대기 중인 태스크에서 `max_parallel` 개만 선택하여 실행합니다:
    ```shell
    bin/run-agent-with-retry.sh verifier-agent <task_id> <log_file> "<prompt>" &
    ```
+   각 태스크의 `status`를 `"running"`으로 업데이트합니다.
 
-4. 모든 verifier-agent 태스크가 완료될 때까지 대기합니다 (`.done` 파일 모니터링, 15초 간격 폴링).
-
-5. 검증 결과를 병합합니다:
+2. 15초 간격으로 폴링하여 완료 여부를 확인합니다:
    ```shell
-   python3 bin/merge-verification-results.py --dir .gemini/agents/logs --output .gemini/agents/logs/pipeline_device_verification.json --aggregated <aggregated_file>
+   ls .gemini/agents/tasks/<task_id>.done 2>/dev/null
+   ls .gemini/agents/tasks/<task_id>.failed 2>/dev/null
    ```
+
+3. 태스크가 완료(`.done` 또는 `.failed`)되면 슬롯이 비므로, 대기 큐에서 다음 태스크를 꺼내 실행합니다.
+
+4. 종료 조건: `running == 0 && pending == 0` (모든 태스크 완료)
+   - 경과 시간 ≥ 1800초(30분)이면 타임아웃 경고를 출력하고 완료된 결과만 사용합니다.
+
+### 4-3. 검증 결과 병합
+
+```shell
+python3 bin/merge-verification-results.py --dir .gemini/agents/logs --output .gemini/agents/logs/pipeline_device_verification.json --aggregated <aggregated_file>
+```
 
 검증 결과에서 `verifiedFailures`가 비어 있으면 "모든 실패가 디바이스 환경 전용 문제입니다. 수정이 필요하지 않습니다." 출력 후 종료합니다.
 
@@ -198,7 +204,42 @@ ls .gemini/agents/workspace/<project_name>/*.xcodeproj 2>/dev/null
 
 ---
 
-## 6단계 — PR 생성 (pr)
+## 6단계 — 재검증 (수정된 테스트 재실행)
+
+**`--skip-fix` 옵션이 지정된 경우 이 단계를 건너뜁니다.**
+
+coder-agent가 수정한 테스트를 실제로 다시 실행하여 수정이 성공했는지 확인합니다.
+
+1. `.gemini/agents/logs/*_fix_report.json` 파일들을 수집합니다.
+2. 각 fix report에서 `className`을 추출하여 재실행 대상 클래스 목록을 만듭니다.
+3. `"status": "needs_review"` 또는 `"status": "failed"`인 report의 클래스는 재검증 대상에서 제외합니다.
+
+4. 해당 클래스만 테스트를 재실행합니다:
+
+   **Android:**
+   ```shell
+   cd .gemini/agents/workspace/<project_name> && ../../../../bin/run-test-android.sh --output-dir ../../../../.gemini/agents/logs/retest --variant <variant> --module <module> --class <fqn1> --class <fqn2> ...
+   ```
+
+   **iOS:**
+   ```shell
+   bin/run-test-ios.sh --project .gemini/agents/workspace/<project_name> --output-dir .gemini/agents/logs/retest --class <fqn1> --class <fqn2> ...
+   ```
+
+5. 재실행 결과를 확인합니다:
+   - **모든 테스트 통과** → "재검증 성공: N개 클래스의 수정이 확인되었습니다." 출력 후 7단계(PR)로 진행합니다.
+   - **여전히 실패 존재** → 파이프라인을 중단하고 다음을 출력합니다:
+     ```
+     [파이프라인] 재검증 실패: N건의 테스트가 수정 후에도 실패합니다.
+     실패 클래스:
+     - <className1>: <실패한 testName 목록>
+     - <className2>: <실패한 testName 목록>
+     수동 확인이 필요합니다.
+     ```
+
+---
+
+## 7단계 — PR 생성 (pr)
 
 **`--skip-pr` 옵션이 지정된 경우 이 단계를 건너뜁니다.**
 
@@ -214,7 +255,7 @@ ls .gemini/agents/workspace/<project_name>/*.xcodeproj 2>/dev/null
 
 ---
 
-## 7단계 — 최종 요약
+## 8단계 — 최종 요약
 
 파이프라인 완료 후 다음 형식으로 요약을 출력합니다:
 
@@ -232,6 +273,7 @@ UITest 파이프라인 완료
 | 테스트 실행 | ✅ 완료 | N개 클래스 실행 |
 | 검증 | ✅ 완료 / ⏭️ 생략 | M개 실패 확인 |
 | 코드 수정 | ✅ 완료 / ⏭️ 생략 | K개 클래스 수정 |
+| 재검증 | ✅ 통과 / ❌ 실패 / ⏭️ 생략 | 수정 후 테스트 재실행 |
 | PR 생성 | ✅ 완료 / ⏭️ 생략 | PR URL |
 ==========================================
 ```
@@ -245,8 +287,6 @@ UITest 파이프라인 완료
 - 모든 파일 경로는 프로젝트 루트 기준 상대 경로를 사용합니다.
 - 각 단계 시작 시 `[파이프라인] === N단계: <단계명> ===` 형식으로 진행 상황을 출력합니다.
 - `--variant`와 `--module` 옵션은 Android 프로젝트에서만 사용됩니다. iOS 프로젝트에서는 무시합니다.
-- `bin/run-test-android.sh`는 내부적으로 APK 빌드, 디바이스 탐지, 샤딩을 자동 처리합니다.
-- `bin/run-test-ios.sh`는 내부적으로 디바이스 풀 관리, xcodebuild 실행, xcresulttool 파싱을 자동 처리합니다.
 
 이제 `{{args}}`를 파싱하고 파이프라인을 실행하세요.
 """

@@ -19,7 +19,7 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Split failedTests into N shards")
-    parser.add_argument("--input", required=True, help="Path to aggregated_uitest_results.json")
+    parser.add_argument("--input", required=True, help="Path to all_uitest_results.json")
     parser.add_argument("--num-shards", type=int, required=True, help="Number of shards")
     parser.add_argument("--output-dir", required=True, help="Directory for shard output files")
     args = parser.parse_args()

@@ -17,15 +17,28 @@ def sanitize_for_json(s: str) -> str:
     return "".join(c if ord(c) >= 32 or c in "\n\r\t" else " " for c in s)
 
 
-def derive_test_file_path(className: str, module_name: str) -> str:
-    """Convert fully qualified class name to test file path relative to project root."""
+def derive_test_file_path(className: str, project_path: str) -> str:
+    """className(FQN)으로 projectPath 하위에서 실제 테스트 파일을 검색."""
     if "." not in className:
-        return f"{module_name}/src/androidTest/java/{className}.kt"
+        simple_name = className
+    else:
+        simple_name = className.rsplit(".", 1)[1]
+
+    # projectPath 하위에서 androidTest 디렉토리 내 파일 검색
+    project = Path(project_path)
+    if project.exists():
+        for ext in ["kt", "java"]:
+            for match in project.rglob(f"{simple_name}.{ext}"):
+                if "androidTest" in match.parts:
+                    try:
+                        return str(match.relative_to(project))
+                    except ValueError:
+                        return str(match)
+
+    # fallback: FQN 기반 추론
     parts = className.rsplit(".", 1)
-    package = parts[0]
-    class_name = parts[1]
-    package_path = package.replace(".", "/")
-    return f"{module_name}/src/androidTest/java/{package_path}/{class_name}.kt"
+    package_path = parts[0].replace(".", "/") if len(parts) > 1 else ""
+    return f"src/androidTest/java/{package_path}/{simple_name}.kt"
 
 
 def parse_xml_file(xml_path: Path) -> Tuple[List[dict], int, int]:
@@ -93,37 +106,22 @@ def main():
     parser.add_argument("xml_dir", help="Directory containing TEST-*.xml files (e.g. build/outputs/androidTest-results/connected/)")
     parser.add_argument("-o", "--output", required=True, help="Output JSON file path")
     parser.add_argument("-p", "--project-path", required=True, help="Project path (e.g. .gemini/agents/workspace/Yogiyo_Android_for_ai)")
-    parser.add_argument("-m", "--module", default="", help="Android module name for testFilePath (auto-detect from path if empty)")
     args = parser.parse_args()
 
     xml_dir = Path(args.xml_dir)
-    module_name = args.module
-    if not module_name and "build/outputs" in str(xml_dir):
-        # Infer module from path: .../module/build/outputs/androidTest-results/...
-        parts = Path(args.xml_dir).parts
-        for i, p in enumerate(parts):
-            if p == "build" and i > 0:
-                module_name = parts[i - 1]
-                break
-    if not module_name:
-        module_name = "yogiyo"
     if not xml_dir.exists():
-        print(json.dumps({
+        empty_result = {
             "platform": "android",
             "projectPath": args.project_path,
             "totalCount": 0,
             "passedCount": 0,
             "failedCount": 0,
             "failedTests": [],
-        }, indent=2, ensure_ascii=False))
-        Path(args.output).write_text(json.dumps({
-            "platform": "android",
-            "projectPath": args.project_path,
-            "totalCount": 0,
-            "passedCount": 0,
-            "failedCount": 0,
-            "failedTests": [],
-        }, indent=2, ensure_ascii=False), encoding="utf-8")
+            "error": "",
+        }
+        print(json.dumps(empty_result, indent=2, ensure_ascii=False))
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(json.dumps(empty_result, indent=2, ensure_ascii=False), encoding="utf-8")
         return
 
     # Find all XML files (including in subdirs like connected/Pixel_3a_API_34/)
@@ -143,7 +141,7 @@ def main():
 
         for f in failed:
             key = (f["className"], f["testName"])
-            f["testFilePath"] = derive_test_file_path(f["className"], module_name)
+            f["testFilePath"] = derive_test_file_path(f["className"], args.project_path)
             if key not in seen:
                 seen.add(key)
                 all_failed.append(f)
@@ -162,6 +160,7 @@ def main():
         "passedCount": max(0, total_count - len(all_failed)),
         "failedCount": len(all_failed),
         "failedTests": all_failed,
+        "error": "",
     }
 
     out_path = Path(args.output)

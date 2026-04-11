@@ -268,18 +268,20 @@ cmd_release() {
   rm -rf "$lock_dir"
 
   # Update pool file if exists
-  if [[ -f "$POOL_FILE" ]] && [[ -n "$os" ]]; then
+  if [[ -f "$POOL_FILE" ]]; then
     local now
     now="$(timestamp_now)"
     python3 -c "
 import json
 pool = json.load(open('$POOL_FILE'))
-for d in pool.get('devices', {}).get('$os', []):
-    if d['id'] == '$device_id':
-        d['status'] = 'idle'
-        d['lockedBy'] = None
-        d['lockedAt'] = None
-        break
+os_list = ['$os'] if '$os' else list(pool.get('devices', {}).keys())
+for os_key in os_list:
+    for d in pool.get('devices', {}).get(os_key, []):
+        if d['id'] == '$device_id':
+            d['status'] = 'idle'
+            d['lockedBy'] = None
+            d['lockedAt'] = None
+            break
 pool['lastUpdated'] = '$now'
 with open('$POOL_FILE', 'w') as f:
     json.dump(pool, f, indent=2, ensure_ascii=False)

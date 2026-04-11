@@ -86,9 +86,9 @@ _LOG_FILE="$LOG_PATH"
 # 테스트 실행은 run-test-android.sh/run-test-ios.sh로 직접 수행 (Gemini API 미사용)
 # verifier-agent는 동시 실행이 많으므로 flash 모델 우선 (rate limit에 강함)
 if [[ "$AGENT" == "verifier-agent" ]]; then
-  MODELS=(gemini-2.5-flash gemini-3-flash-preview gemini-2.5-pro)
+  MODELS=(gemini-flash-latest gemini-2.5-flash gemini-2.5-pro)
 else
-  MODELS=(gemini-3-pro-preview gemini-2.5-pro gemini-3-flash-preview gemini-2.5-flash)
+  MODELS=(gemini-2.5-pro gemini-flash-latest gemini-2.5-flash)
 fi
 MAX_RETRIES=3
 

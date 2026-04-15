@@ -238,93 +238,20 @@ log_info "[TEST-LOG] END xcodebuild: exit $TEST_EXIT_CODE"
 
 # ─── Parse results ──────────────────────────────────────────────────────────
 
-XCRESULT="$(find "$PROJECT_PATH" -name '*.xcresult' -newer "$LOG_PATH" 2>/dev/null | head -1)"
+# xcresult 탐색: 빌드 로그에서 경로 추출 → DerivedData 폴백
+XCRESULT="$(grep -oE '/[^ ]*\.xcresult' "$LOG_PATH" 2>/dev/null | tail -1)"
+if [[ ! -d "$XCRESULT" ]]; then
+  XCRESULT="$(find ~/Library/Developer/Xcode/DerivedData -name '*.xcresult' -type d 2>/dev/null | xargs ls -dt 2>/dev/null | head -1)"
+fi
 
 if [[ -n "$XCRESULT" ]]; then
-  log_info "[TEST-LOG] START parse: xcrun xcresulttool get --path $XCRESULT"
+  log_info "[TEST-LOG] START parse: $XCRESULT"
 
-  python3 -c "
-import json, subprocess, sys
-
-result_path = '$XCRESULT'
-try:
-    raw = subprocess.check_output(
-        ['xcrun', 'xcresulttool', 'get', '--path', result_path, '--format', 'json'],
-        text=True
-    )
-    data = json.loads(raw)
-
-    failed_tests = []
-    total = 0
-    passed = 0
-
-    def walk_tests(node, class_name=''):
-        nonlocal total, passed
-        if 'subtests' in node:
-            name = node.get('name', {}).get('_value', class_name)
-            for sub in node['subtests']['_values']:
-                walk_tests(sub, name)
-        elif 'testStatus' in node:
-            total += 1
-            status = node['testStatus']['_value']
-            test_name = node.get('name', {}).get('_value', '')
-            if status == 'Success':
-                passed += 1
-            else:
-                msg = ''
-                if 'summaryRef' in node:
-                    msg = node.get('summaryRef', {}).get('_value', '')
-                failed_tests.append({
-                    'className': class_name,
-                    'testName': test_name,
-                    'errorMessage': msg,
-                    'stackTrace': '',
-                    'testFilePath': ''
-                })
-
-    actions = data.get('actions', {}).get('_values', [])
-    for action in actions:
-        testsRef = action.get('actionResult', {}).get('testsRef', {})
-        if testsRef:
-            tests_id = testsRef.get('id', {}).get('_value', '')
-            if tests_id:
-                tests_raw = subprocess.check_output(
-                    ['xcrun', 'xcresulttool', 'get', '--path', result_path,
-                     '--format', 'json', '--id', tests_id],
-                    text=True
-                )
-                tests_data = json.loads(tests_raw)
-                for suite in tests_data.get('summaries', {}).get('_values', []):
-                    for group in suite.get('testableSummaries', {}).get('_values', []):
-                        for test in group.get('tests', {}).get('_values', []):
-                            walk_tests(test)
-
-    output = {
-        'platform': 'ios',
-        'projectPath': '$PROJECT_PATH_META',
-        'totalCount': total,
-        'passedCount': passed,
-        'failedCount': len(failed_tests),
-        'failedTests': failed_tests,
-        'error': ''
-    }
-    with open('$RESULT_FILE', 'w') as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f'Parsed {total} tests, {len(failed_tests)} failures')
-except Exception as e:
-    print(f'Error parsing xcresult: {e}', file=sys.stderr)
-    output = {
-        'platform': 'ios',
-        'projectPath': '$PROJECT_PATH_META',
-        'totalCount': 0,
-        'passedCount': 0,
-        'failedCount': 0,
-        'failedTests': [],
-        'error': str(e)
-    }
-    with open('$RESULT_FILE', 'w') as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-" >> "$LOG_PATH" 2>&1
+  python3 "$SCRIPT_DIR/parse-xcresult.py" \
+    --xcresult "$XCRESULT" \
+    --output-dir "$(dirname "$RESULT_FILE")" \
+    --project-path "$PROJECT_PATH_META" \
+    >> "$LOG_PATH" 2>&1
 
   log_info "[TEST-LOG] END parse: wrote results to $RESULT_FILE"
 else

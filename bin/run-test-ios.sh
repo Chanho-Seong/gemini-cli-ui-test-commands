@@ -50,7 +50,7 @@ PROJECT_PATH=""
 OUTPUT_DIR="$PROJECT_ROOT/.gemini/agents/logs"
 PROJECT_PATH_META="."
 DRY_RUN=false
-DEVICE_ID=""
+DEVICE_IDS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -141,44 +141,61 @@ fi
 
 DEVICE_POOL_SCRIPT="$SCRIPT_DIR/device-pool.sh"
 
-acquire_device() {
+acquire_all_devices() {
   if [[ ! -x "$DEVICE_POOL_SCRIPT" ]]; then
     log_warn "device-pool.sh not found, running without device management"
     return 0
   fi
 
-  log_info "Acquiring iOS device..."
+  local idle_count
+  idle_count="$("$DEVICE_POOL_SCRIPT" count ios 2>/dev/null || echo 0)"
+  log_info "Idle iOS devices: $idle_count"
+
+  if [[ "$idle_count" -eq 0 ]]; then
+    log_info "No iOS devices in pool"
+    return 0
+  fi
 
   local max_wait=300  # 5분 대기
   local waited=0
   local interval=10
 
-  while true; do
-    DEVICE_ID="$("$DEVICE_POOL_SCRIPT" acquire "ios" "test-ios" "$$" 2>/dev/null)" && break
-    waited=$((waited + interval))
-    if [[ $waited -ge $max_wait ]]; then
-      log_error "Timeout waiting for iOS device (${max_wait}s)"
-      return 1
+  for ((i = 0; i < idle_count; i++)); do
+    local did=""
+    waited=0
+    while true; do
+      did="$("$DEVICE_POOL_SCRIPT" acquire "ios" "test-ios" "$$" 2>/dev/null)" && break
+      waited=$((waited + interval))
+      if [[ $waited -ge $max_wait ]]; then
+        log_warn "Timeout acquiring device $((i + 1))/$idle_count, continuing with ${#DEVICE_IDS[@]} device(s)"
+        break 2
+      fi
+      sleep "$interval"
+    done
+    if [[ -n "$did" ]]; then
+      DEVICE_IDS+=("$did")
+      log_info "Acquired device $((i + 1)): $did"
     fi
-    log_info "No idle iOS device, waiting... (${waited}s/${max_wait}s)"
-    sleep "$interval"
   done
 
-  log_info "Acquired device: $DEVICE_ID"
+  log_info "Acquired ${#DEVICE_IDS[@]} iOS device(s)"
 }
 
-release_device() {
-  if [[ -n "$DEVICE_ID" ]] && [[ -x "$DEVICE_POOL_SCRIPT" ]]; then
-    log_info "Releasing device: $DEVICE_ID"
-    "$DEVICE_POOL_SCRIPT" release "$DEVICE_ID" >> "$LOG_PATH" 2>&1 || true
-    DEVICE_ID=""
+release_all_devices() {
+  if [[ ${#DEVICE_IDS[@]} -eq 0 ]] || [[ ! -x "$DEVICE_POOL_SCRIPT" ]]; then
+    return 0
   fi
+  for did in "${DEVICE_IDS[@]}"; do
+    log_info "Releasing device: $did"
+    "$DEVICE_POOL_SCRIPT" release "$did" >> "$LOG_PATH" 2>&1 || true
+  done
+  DEVICE_IDS=()
 }
 
 # EXIT trap: 디바이스 해제 보장
 cleanup() {
   local exit_code=$?
-  release_device
+  release_all_devices
 
   if [[ $exit_code -eq 0 ]]; then
     log_info "Completed successfully"
@@ -189,28 +206,69 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# ─── Acquire device ─────────────────────────────────────────────────────────
+# ─── Acquire devices ───────────────────────────────────────────────────────
 
-acquire_device || exit 1
+acquire_all_devices
 
-# ─── Resolve build command ──────────────────────────────────────────────────
+# ─── Resolve destination ───────────────────────────────────────────────────
 
-if [[ -n "$DEVICE_ID" ]]; then
-  DESTINATION="id=$DEVICE_ID"
+DEST_ARGS=""
+PARALLEL_ARGS=""
+
+if [[ ${#DEVICE_IDS[@]} -gt 0 ]]; then
+  # 디바이스 풀에서 acquire한 기기 사용
+  for did in "${DEVICE_IDS[@]}"; do
+    DEST_ARGS="$DEST_ARGS -destination 'id=$did'"
+  done
+  if [[ ${#DEVICE_IDS[@]} -gt 1 ]]; then
+    PARALLEL_ARGS="-parallel-testing-enabled YES -parallelize-tests-among-destinations"
+    log_info "Parallel testing enabled: ${#DEVICE_IDS[@]} devices"
+  fi
 else
-  DESTINATION="platform=iOS Simulator,name=iPhone 15"
+  # 시뮬레이터 폴백: Booted 시뮬레이터 탐지 → 없으면 기본 시뮬레이터
+  log_info "No physical devices, falling back to simulator"
+  local booted_udid
+  booted_udid="$(xcrun simctl list devices booted 2>/dev/null | grep -oE '[0-9A-F-]{36}' | head -1)"
+  if [[ -n "$booted_udid" ]]; then
+    DEST_ARGS="-destination 'id=$booted_udid'"
+    log_info "Using booted simulator: $booted_udid"
+  else
+    DEST_ARGS="-destination 'platform=iOS Simulator'"
+    log_info "Using default simulator"
+  fi
 fi
 
-# xcworkspace 또는 xcodeproj 자동 탐색
+# ─── xcworkspace 탐색 ───────────────────────────────────────────────────────
 WORKSPACE_FILE="$(find "$PROJECT_PATH" -maxdepth 1 -name '*.xcworkspace' -not -name 'Pods*' | head -1)"
-if [[ -n "$WORKSPACE_FILE" ]]; then
-  SCHEME="$(basename "$WORKSPACE_FILE" .xcworkspace)"
-  BUILD_BASE="xcodebuild test -workspace $WORKSPACE_FILE -scheme $SCHEME -destination '$DESTINATION'"
-else
-  XCODEPROJ_FILE="$(find "$PROJECT_PATH" -maxdepth 1 -name '*.xcodeproj' | head -1)"
-  SCHEME="$(basename "$XCODEPROJ_FILE" .xcodeproj)"
-  BUILD_BASE="xcodebuild test -project $XCODEPROJ_FILE -scheme $SCHEME -destination '$DESTINATION'"
+if [[ -z "$WORKSPACE_FILE" ]]; then
+  log_error "No .xcworkspace found in $PROJECT_PATH"
+  exit 1
 fi
+
+# ─── scheme 결정 ────────────────────────────────────────────────────────────
+# --class yogiyoapp_enterpriseUITests/LocationUITests 형태에서 scheme 추론
+# yogiyoapp_enterpriseUITests → UITests 제거 → yogiyoapp_enterprise
+if [[ ${#TEST_CLASSES[@]} -gt 0 ]]; then
+  SCHEME="$(echo "${TEST_CLASSES[0]}" | cut -d/ -f1 | sed 's/UITests$//')"
+else
+  SCHEME="$(basename "$WORKSPACE_FILE" .xcworkspace)"
+fi
+log_info "Scheme: $SCHEME"
+
+# ─── testPlan 탐색 ──────────────────────────────────────────────────────────
+# UITest 타겟 디렉토리에서 .xctestplan 파일을 찾아 자동 적용
+TESTPLAN_ARG=""
+if [[ ${#TEST_CLASSES[@]} -gt 0 ]]; then
+  UITEST_TARGET="$(echo "${TEST_CLASSES[0]}" | cut -d/ -f1)"
+  TESTPLAN_FILE="$(find "$PROJECT_PATH/$UITEST_TARGET" -maxdepth 1 -name '*.xctestplan' 2>/dev/null | head -1)"
+  if [[ -n "$TESTPLAN_FILE" ]]; then
+    TESTPLAN_ARG="-testPlan $(basename "$TESTPLAN_FILE" .xctestplan)"
+    log_info "Using testplan: $(basename "$TESTPLAN_FILE" .xctestplan)"
+  fi
+fi
+
+# ─── 빌드 커맨드 조립 ──────────────────────────────────────────────────────
+BUILD_BASE="xcodebuild test -workspace $WORKSPACE_FILE -scheme $SCHEME $DEST_ARGS $TESTPLAN_ARG $PARALLEL_ARGS"
 
 # ─── Run tests ──────────────────────────────────────────────────────────────
 

@@ -109,8 +109,8 @@ if [[ -z "$PROJECT_PATH" ]]; then
   fi
 fi
 
-# Normalize project path
-PROJECT_PATH="${PROJECT_PATH%/}"
+# Normalize project path (절대 경로 변환 — cd 후에도 유효하도록)
+PROJECT_PATH="$(cd "${PROJECT_PATH%/}" && pwd)"
 
 log_info "Platform: iOS"
 log_info "Project: $PROJECT_PATH"

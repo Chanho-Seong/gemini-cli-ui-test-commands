@@ -50,7 +50,7 @@ PROJECT_PATH=""
 OUTPUT_DIR="$PROJECT_ROOT/.gemini/agents/logs"
 PROJECT_PATH_META="."
 DRY_RUN=false
-DEVICE_ID=""
+DEVICE_IDS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -109,8 +109,8 @@ if [[ -z "$PROJECT_PATH" ]]; then
   fi
 fi
 
-# Normalize project path
-PROJECT_PATH="${PROJECT_PATH%/}"
+# Normalize project path (절대 경로 변환 — cd 후에도 유효하도록)
+PROJECT_PATH="$(cd "${PROJECT_PATH%/}" && pwd)"
 
 log_info "Platform: iOS"
 log_info "Project: $PROJECT_PATH"
@@ -141,44 +141,61 @@ fi
 
 DEVICE_POOL_SCRIPT="$SCRIPT_DIR/device-pool.sh"
 
-acquire_device() {
+acquire_all_devices() {
   if [[ ! -x "$DEVICE_POOL_SCRIPT" ]]; then
     log_warn "device-pool.sh not found, running without device management"
     return 0
   fi
 
-  log_info "Acquiring iOS device..."
+  local idle_count
+  idle_count="$("$DEVICE_POOL_SCRIPT" count ios 2>/dev/null || echo 0)"
+  log_info "Idle iOS devices: $idle_count"
+
+  if [[ "$idle_count" -eq 0 ]]; then
+    log_info "No iOS devices in pool"
+    return 0
+  fi
 
   local max_wait=300  # 5분 대기
   local waited=0
   local interval=10
 
-  while true; do
-    DEVICE_ID="$("$DEVICE_POOL_SCRIPT" acquire "ios" "test-ios" "$$" 2>/dev/null)" && break
-    waited=$((waited + interval))
-    if [[ $waited -ge $max_wait ]]; then
-      log_error "Timeout waiting for iOS device (${max_wait}s)"
-      return 1
+  for ((i = 0; i < idle_count; i++)); do
+    local did=""
+    waited=0
+    while true; do
+      did="$("$DEVICE_POOL_SCRIPT" acquire "ios" "test-ios" "$$" 2>/dev/null)" && break
+      waited=$((waited + interval))
+      if [[ $waited -ge $max_wait ]]; then
+        log_warn "Timeout acquiring device $((i + 1))/$idle_count, continuing with ${#DEVICE_IDS[@]} device(s)"
+        break 2
+      fi
+      sleep "$interval"
+    done
+    if [[ -n "$did" ]]; then
+      DEVICE_IDS+=("$did")
+      log_info "Acquired device $((i + 1)): $did"
     fi
-    log_info "No idle iOS device, waiting... (${waited}s/${max_wait}s)"
-    sleep "$interval"
   done
 
-  log_info "Acquired device: $DEVICE_ID"
+  log_info "Acquired ${#DEVICE_IDS[@]} iOS device(s)"
 }
 
-release_device() {
-  if [[ -n "$DEVICE_ID" ]] && [[ -x "$DEVICE_POOL_SCRIPT" ]]; then
-    log_info "Releasing device: $DEVICE_ID"
-    "$DEVICE_POOL_SCRIPT" release "$DEVICE_ID" >> "$LOG_PATH" 2>&1 || true
-    DEVICE_ID=""
+release_all_devices() {
+  if [[ ${#DEVICE_IDS[@]} -eq 0 ]] || [[ ! -x "$DEVICE_POOL_SCRIPT" ]]; then
+    return 0
   fi
+  for did in "${DEVICE_IDS[@]}"; do
+    log_info "Releasing device: $did"
+    "$DEVICE_POOL_SCRIPT" release "$did" >> "$LOG_PATH" 2>&1 || true
+  done
+  DEVICE_IDS=()
 }
 
 # EXIT trap: 디바이스 해제 보장
 cleanup() {
   local exit_code=$?
-  release_device
+  release_all_devices
 
   if [[ $exit_code -eq 0 ]]; then
     log_info "Completed successfully"
@@ -189,28 +206,69 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-# ─── Acquire device ─────────────────────────────────────────────────────────
+# ─── Acquire devices ───────────────────────────────────────────────────────
 
-acquire_device || exit 1
+acquire_all_devices
 
-# ─── Resolve build command ──────────────────────────────────────────────────
+# ─── Resolve destination ───────────────────────────────────────────────────
 
-if [[ -n "$DEVICE_ID" ]]; then
-  DESTINATION="id=$DEVICE_ID"
+DEST_ARGS=""
+PARALLEL_ARGS=""
+
+if [[ ${#DEVICE_IDS[@]} -gt 0 ]]; then
+  # 디바이스 풀에서 acquire한 기기 사용
+  for did in "${DEVICE_IDS[@]}"; do
+    DEST_ARGS="$DEST_ARGS -destination 'id=$did'"
+  done
+  if [[ ${#DEVICE_IDS[@]} -gt 1 ]]; then
+    PARALLEL_ARGS="-parallel-testing-enabled YES -parallelize-tests-among-destinations"
+    log_info "Parallel testing enabled: ${#DEVICE_IDS[@]} devices"
+  fi
 else
-  DESTINATION="platform=iOS Simulator,name=iPhone 15"
+  # 시뮬레이터 폴백: Booted 시뮬레이터 탐지 → 없으면 기본 시뮬레이터
+  log_info "No physical devices, falling back to simulator"
+  local booted_udid
+  booted_udid="$(xcrun simctl list devices booted 2>/dev/null | grep -oE '[0-9A-F-]{36}' | head -1)"
+  if [[ -n "$booted_udid" ]]; then
+    DEST_ARGS="-destination 'id=$booted_udid'"
+    log_info "Using booted simulator: $booted_udid"
+  else
+    DEST_ARGS="-destination 'platform=iOS Simulator'"
+    log_info "Using default simulator"
+  fi
 fi
 
-# xcworkspace 또는 xcodeproj 자동 탐색
+# ─── xcworkspace 탐색 ───────────────────────────────────────────────────────
 WORKSPACE_FILE="$(find "$PROJECT_PATH" -maxdepth 1 -name '*.xcworkspace' -not -name 'Pods*' | head -1)"
-if [[ -n "$WORKSPACE_FILE" ]]; then
-  SCHEME="$(basename "$WORKSPACE_FILE" .xcworkspace)"
-  BUILD_BASE="xcodebuild test -workspace $WORKSPACE_FILE -scheme $SCHEME -destination '$DESTINATION'"
-else
-  XCODEPROJ_FILE="$(find "$PROJECT_PATH" -maxdepth 1 -name '*.xcodeproj' | head -1)"
-  SCHEME="$(basename "$XCODEPROJ_FILE" .xcodeproj)"
-  BUILD_BASE="xcodebuild test -project $XCODEPROJ_FILE -scheme $SCHEME -destination '$DESTINATION'"
+if [[ -z "$WORKSPACE_FILE" ]]; then
+  log_error "No .xcworkspace found in $PROJECT_PATH"
+  exit 1
 fi
+
+# ─── scheme 결정 ────────────────────────────────────────────────────────────
+# --class yogiyoapp_enterpriseUITests/LocationUITests 형태에서 scheme 추론
+# yogiyoapp_enterpriseUITests → UITests 제거 → yogiyoapp_enterprise
+if [[ ${#TEST_CLASSES[@]} -gt 0 ]]; then
+  SCHEME="$(echo "${TEST_CLASSES[0]}" | cut -d/ -f1 | sed 's/UITests$//')"
+else
+  SCHEME="$(basename "$WORKSPACE_FILE" .xcworkspace)"
+fi
+log_info "Scheme: $SCHEME"
+
+# ─── testPlan 탐색 ──────────────────────────────────────────────────────────
+# UITest 타겟 디렉토리에서 .xctestplan 파일을 찾아 자동 적용
+TESTPLAN_ARG=""
+if [[ ${#TEST_CLASSES[@]} -gt 0 ]]; then
+  UITEST_TARGET="$(echo "${TEST_CLASSES[0]}" | cut -d/ -f1)"
+  TESTPLAN_FILE="$(find "$PROJECT_PATH/$UITEST_TARGET" -maxdepth 1 -name '*.xctestplan' 2>/dev/null | head -1)"
+  if [[ -n "$TESTPLAN_FILE" ]]; then
+    TESTPLAN_ARG="-testPlan $(basename "$TESTPLAN_FILE" .xctestplan)"
+    log_info "Using testplan: $(basename "$TESTPLAN_FILE" .xctestplan)"
+  fi
+fi
+
+# ─── 빌드 커맨드 조립 ──────────────────────────────────────────────────────
+BUILD_BASE="xcodebuild test -workspace $WORKSPACE_FILE -scheme $SCHEME $DEST_ARGS $TESTPLAN_ARG $PARALLEL_ARGS"
 
 # ─── Run tests ──────────────────────────────────────────────────────────────
 
@@ -238,93 +296,20 @@ log_info "[TEST-LOG] END xcodebuild: exit $TEST_EXIT_CODE"
 
 # ─── Parse results ──────────────────────────────────────────────────────────
 
-XCRESULT="$(find "$PROJECT_PATH" -name '*.xcresult' -newer "$LOG_PATH" 2>/dev/null | head -1)"
+# xcresult 탐색: 빌드 로그에서 경로 추출 → DerivedData 폴백
+XCRESULT="$(grep -oE '/[^ ]*\.xcresult' "$LOG_PATH" 2>/dev/null | tail -1)"
+if [[ ! -d "$XCRESULT" ]]; then
+  XCRESULT="$(find ~/Library/Developer/Xcode/DerivedData -name '*.xcresult' -type d 2>/dev/null | xargs ls -dt 2>/dev/null | head -1)"
+fi
 
 if [[ -n "$XCRESULT" ]]; then
-  log_info "[TEST-LOG] START parse: xcrun xcresulttool get --path $XCRESULT"
+  log_info "[TEST-LOG] START parse: $XCRESULT"
 
-  python3 -c "
-import json, subprocess, sys
-
-result_path = '$XCRESULT'
-try:
-    raw = subprocess.check_output(
-        ['xcrun', 'xcresulttool', 'get', '--path', result_path, '--format', 'json'],
-        text=True
-    )
-    data = json.loads(raw)
-
-    failed_tests = []
-    total = 0
-    passed = 0
-
-    def walk_tests(node, class_name=''):
-        nonlocal total, passed
-        if 'subtests' in node:
-            name = node.get('name', {}).get('_value', class_name)
-            for sub in node['subtests']['_values']:
-                walk_tests(sub, name)
-        elif 'testStatus' in node:
-            total += 1
-            status = node['testStatus']['_value']
-            test_name = node.get('name', {}).get('_value', '')
-            if status == 'Success':
-                passed += 1
-            else:
-                msg = ''
-                if 'summaryRef' in node:
-                    msg = node.get('summaryRef', {}).get('_value', '')
-                failed_tests.append({
-                    'className': class_name,
-                    'testName': test_name,
-                    'errorMessage': msg,
-                    'stackTrace': '',
-                    'testFilePath': ''
-                })
-
-    actions = data.get('actions', {}).get('_values', [])
-    for action in actions:
-        testsRef = action.get('actionResult', {}).get('testsRef', {})
-        if testsRef:
-            tests_id = testsRef.get('id', {}).get('_value', '')
-            if tests_id:
-                tests_raw = subprocess.check_output(
-                    ['xcrun', 'xcresulttool', 'get', '--path', result_path,
-                     '--format', 'json', '--id', tests_id],
-                    text=True
-                )
-                tests_data = json.loads(tests_raw)
-                for suite in tests_data.get('summaries', {}).get('_values', []):
-                    for group in suite.get('testableSummaries', {}).get('_values', []):
-                        for test in group.get('tests', {}).get('_values', []):
-                            walk_tests(test)
-
-    output = {
-        'platform': 'ios',
-        'projectPath': '$PROJECT_PATH_META',
-        'totalCount': total,
-        'passedCount': passed,
-        'failedCount': len(failed_tests),
-        'failedTests': failed_tests,
-        'error': ''
-    }
-    with open('$RESULT_FILE', 'w') as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f'Parsed {total} tests, {len(failed_tests)} failures')
-except Exception as e:
-    print(f'Error parsing xcresult: {e}', file=sys.stderr)
-    output = {
-        'platform': 'ios',
-        'projectPath': '$PROJECT_PATH_META',
-        'totalCount': 0,
-        'passedCount': 0,
-        'failedCount': 0,
-        'failedTests': [],
-        'error': str(e)
-    }
-    with open('$RESULT_FILE', 'w') as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-" >> "$LOG_PATH" 2>&1
+  python3 "$SCRIPT_DIR/parse-xcresult.py" \
+    --xcresult "$XCRESULT" \
+    --output-dir "$(dirname "$RESULT_FILE")" \
+    --project-path "$PROJECT_PATH_META" \
+    >> "$LOG_PATH" 2>&1
 
   log_info "[TEST-LOG] END parse: wrote results to $RESULT_FILE"
 else

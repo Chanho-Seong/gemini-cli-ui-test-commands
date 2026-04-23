@@ -1,0 +1,271 @@
+---
+name: uitest-loop
+description: Android/iOS UI 테스트의 검증 루프(run → AI verify → fix → re-run)를 자동 수행한다. connectedAndroidTest 또는 xcodebuild test로 실행하고, mobile-mcp 로 실단말에서 시나리오를 재현해 검증한 뒤, 컨벤션에 맞춰 테스트/프러덕 코드를 수정하고 재실행까지 수행한다. "UI 테스트 검증 루프", "UI 테스트 고쳐줘", "실패한 instrumentation 테스트 분석", "uitest 루프", "xcuitest 자동 수정", "connectedAndroidTest 실패 자동 복구" 같은 요청에 사용.
+argument-hint: "[--class <fqn>]... [--suite <fqn>] [--method <test>] [--variant <name>] [--module <name>] [--device <id>] [--skip-verify] [--dry-run]"
+allowed-tools: Bash Read Edit Grep Glob mcp__mobile-mcp__*
+---
+
+# UI Test Loop — 실행 가이드
+
+당신의 목표는 현재 작업 디렉토리의 Android 또는 iOS 프로젝트에서 UI 테스트 실패를 자동으로 진단·수정하고, 고친 뒤 재실행까지 수행해 최종 리포트를 출력하는 것이다.
+
+산출물은 모두 **메인 모듈의 `build/ai-uitest/` 하위**에 저장되며, 각 단계 종료 시 데스크탑 알림이 발행된다.
+
+## 의존성 (MCP)
+
+이 skill 은 **AI Verify 단계**에서 `mobile-mcp` MCP 서버를 사용해 실단말 시나리오를 재현한다. Skill 자체로는 MCP 를 자동 설치하지 않으므로, 사용 전에 `mobile-mcp` 가 이미 등록되어 있어야 한다.
+
+- 미등록 상태로 skill 을 실행하면 `mcp__mobile-mcp__*` 호출이 실패한다. 이 때 AI Verify 를 건너뛰려면 `--skip-verify` 로 재호출.
+- `allowed-tools` 에 `mcp__mobile-mcp__*` 와일드카드를 포함하여 verify 단계의 반복 승인 프롬프트를 방지한다. 단말 고정은 1번 단계에서 이미 사용자가 확인하므로 중복 승인이 되지 않도록 한 것이다.
+- 수동 등록 방법 및 플러그인 배포 시 자동 등록 방법은 **[references/mcp-setup.md](references/mcp-setup.md)** 참조.
+
+## Arguments
+
+`$ARGUMENTS` 에서 다음을 파싱한다 (전부 선택):
+- `--class <FQCN>` — 실행할 테스트 클래스. 복수 지정 가능 (반복 flag).
+- `--suite <FQCN>` — 테스트 스위트 (`@RunWith(Suite.class)` / iOS test plan).
+- `--method <name>` — 특정 테스트 메서드 (반드시 `--class` 와 함께).
+- `--variant <name>` — Android buildVariant (기본: `debug`).
+- `--module <name>` — Android Gradle 모듈명. 미지정 시 `settings.gradle*` 에서 `com.android.application` 적용 모듈을 자동 감지.
+- `--device <id>` — 사용할 디바이스 id (Android adb serial, iOS UDID). 미지정 시 기존 pin 재사용 또는 사용자 확인.
+- `--skip-verify` — AI Verify 단계 스킵 (실단말 재현 없이 바로 fix 로 진행).
+- `--dry-run` — 실제 실행 없이 계획만 출력.
+
+**중요:** `--class` / `--suite` / `--method` 가 지정되면 **1차 실행, Verify, 재테스트 모두 동일한 필터 범위 내**에서만 동작해야 한다. 지정 범위 밖으로 실행을 확장하지 말 것.
+
+---
+
+## 실행 플로우 (반드시 순서대로)
+
+### 0. 환경 준비
+
+플랫폼/메인모듈/빌드 디렉토리를 감지하고 환경 변수로 보관한다.
+
+```bash
+eval "$(bash ${CLAUDE_SKILL_DIR}/scripts/detect-platform.sh)"
+BUILD_DIR="$(bash ${CLAUDE_SKILL_DIR}/scripts/resolve-build-dir.sh ${MODULE_ARG:-})"
+export BUILD_DIR PLATFORM MAIN_MODULE
+mkdir -p "$BUILD_DIR/logs" "$BUILD_DIR/screenshots" "$BUILD_DIR/retest" "$BUILD_DIR/state"
+bash ${CLAUDE_SKILL_DIR}/scripts/ensure-gitignore.sh "$BUILD_DIR"
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh start "PLATFORM=$PLATFORM MAIN_MODULE=$MAIN_MODULE"
+```
+
+`PLATFORM` 이 `unknown` 이면 에러 메시지와 함께 중단하고 사용자에게 경로 확인을 요청한다.
+
+### 1. 디바이스 확인 / 고정
+
+- `--device <id>` 가 지정된 경우:
+  ```bash
+  bash ${CLAUDE_SKILL_DIR}/scripts/device-select.sh pin "$PLATFORM" "<id>" --build-dir "$BUILD_DIR"
+  ```
+- 미지정인 경우 기존 핀을 재사용:
+  ```bash
+  CURRENT_DEVICE="$(bash ${CLAUDE_SKILL_DIR}/scripts/device-select.sh current --build-dir "$BUILD_DIR" 2>/dev/null || echo '')"
+  ```
+- 핀이 없으면 디바이스 목록을 조회하고 **사용자에게 선택 요청**:
+  ```bash
+  bash ${CLAUDE_SKILL_DIR}/scripts/device-select.sh list "$PLATFORM"
+  ```
+  목록이 1개뿐이면 그 디바이스를 자동 pin. 2개 이상이면 사용자에게 "어떤 디바이스를 사용하시겠습니까?" 라고 확인한 뒤 선택값을 pin.
+- 최종 `CURRENT_DEVICE` 를 이후 모든 단계에서 `--device` 인자로 전달한다.
+
+### 2. `--dry-run` 분기
+
+`--dry-run` 이면 run-test-*.sh 를 `--dry-run` 으로 호출하여 계획만 출력하고 종료.
+
+### 3. 1차 테스트 실행
+
+**테스트 필터 (--class/--suite/--method) 를 정확히 전달한다.**
+**중요:** Bash 툴 호출 시 **반드시 한 줄**로 작성한다. 다중 라인 `\` 연결은 쓰지 말 것 (툴 실행 중 분해되어 실패).
+
+**Android variant 처리:** `--variant` 를 지정하지 않으면 스크립트가 `<module>/build.gradle*` 을 파싱해 `productFlavors + buildTypes` 조합을 추정하고 **debug 우선** 으로 자동 선택한다.
+사용자가 `--variant` 를 주지 않았더라도 **첫 호출에서 바로 올바른 variant** (예: `googleDebug`) 를 찾는다. 따라서 실패 → 변경 재시도 루프를 돌리지 말 것. 감지 결과가 의심스러우면 다음 명령으로 후보를 먼저 확인:
+```
+bash "${CLAUDE_SKILL_DIR}/scripts/detect-variants.sh" --module "$MAIN_MODULE" --fast
+```
+
+Android (예시 — 인자 순서 자유, 필요 시 반복):
+```
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/logs" --module "$MAIN_MODULE" --device "$CURRENT_DEVICE" --project-path "." --class com.example.FooTest
+```
+(VARIANT 가 사용자 인자로 넘어온 경우만 `--variant "$VARIANT"` 를 추가. 안 넘어왔으면 생략 — 자동 감지.)
+
+iOS:
+```
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-ios.sh" --output-dir "$BUILD_DIR/logs" --device "$CURRENT_DEVICE" --project-path "." --class MyAppUITests/LoginTest
+```
+
+**단일 디바이스 전제:** `--device "$CURRENT_DEVICE"` 가 지정된 상태이므로 스크립트는 **샤딩 없이** 해당 단말에서 단일 `am instrument` 실행으로 돌린다. 여러 단말을 병렬 활용할 필요가 있으면 `--device` 를 생략하면 되지만, 이 skill 의 기본 동작은 pin 된 1대만 사용.
+
+결과: `$BUILD_DIR/logs/all_uitest_results.json` — `selectionFilter` 필드에 지정 인자가 기록됨.
+
+```bash
+FAILED=$(python3 -c "import json; print(json.load(open('$BUILD_DIR/logs/all_uitest_results.json'))['failedCount'])")
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh tests-done "실패 ${FAILED}건"
+```
+
+`FAILED == 0` 이면 **바로 9번(최종 리포트)** 로 점프.
+
+### 4. AI Verify (실단말 재현)
+
+`--skip-verify` 이면 이 섹션 전체를 건너뛰고 `failedTests` 를 그대로 `verifiedFailures` 로 간주하여 `$BUILD_DIR/logs/device_verification.json` 에 작성 후 다음 단계로.
+
+그 외:
+1. `$BUILD_DIR/logs/all_uitest_results.json` 의 `failedTests` 를 **모두** 순회 (필터 범위 내).
+2. 각 테스트에 대해:
+   - `Read` 로 테스트 소스 파일을 찾아 읽고 시나리오 (클릭/입력/assertion) 를 추출.
+   - mobile-mcp 로 `CURRENT_DEVICE` 에서 앱을 실행하고 시나리오를 재현.
+     - `mcp__mobile-mcp__mobile_list_available_devices` 로 디바이스 확인.
+     - `mcp__mobile-mcp__mobile_launch_app` (Android: package, iOS: bundle id).
+     - `mcp__mobile-mcp__mobile_list_elements_on_screen` → 좌표 파악 후 `mobile_click_on_screen_at_coordinates` / `mobile_type_keys` / `mobile_swipe_on_screen` 로 조작.
+     - 핵심 시점마다 `mcp__mobile-mcp__mobile_take_screenshot` → 파일을 `$BUILD_DIR/screenshots/<className>_<testName>.png` 로 저장.
+   - 판정:
+     - 실제로 실패 재현 → `verifiedFailures` 에 추가.
+     - 다른 경로로 동일 목적 달성 가능 → `verifiedPasses` 에 추가 (환경차로 판명).
+3. 결과 스키마:
+   ```json
+   {
+     "platform": "<android|ios>",
+     "deviceId": "<id>",
+     "projectPath": ".",
+     "verifiedFailures": [
+       {"className":"...","testName":"...","errorMessage":"...","stackTrace":"...","testFilePath":"...","deviceResult":"FAILED","verificationNote":"..."}
+     ],
+     "verifiedPasses": [
+       {"className":"...","testName":"...","deviceResult":"PASSED","verificationNote":"대체 경로로 성공"}
+     ]
+   }
+   ```
+4. `$BUILD_DIR/logs/device_verification.json` 으로 저장.
+
+```bash
+VF=$(python3 -c "import json; print(len(json.load(open('$BUILD_DIR/logs/device_verification.json'))['verifiedFailures']))")
+VP=$(python3 -c "import json; print(len(json.load(open('$BUILD_DIR/logs/device_verification.json'))['verifiedPasses']))")
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh verify-done "실제 실패 ${VF}건 / 환경차 ${VP}건"
+```
+
+`verifiedFailures` 가 비어 있으면 9번(최종 리포트)로 점프 — 모두 환경 문제였음.
+
+### 5. 코드 수정
+
+**먼저 컨벤션과 실패 패턴 문서를 반드시 읽는다:**
+- Android: `Read` `${CLAUDE_SKILL_DIR}/references/android-uitest-conventions.md`
+- iOS: `Read` `${CLAUDE_SKILL_DIR}/references/ios-uitest-conventions.md`
+- 공통: `Read` `${CLAUDE_SKILL_DIR}/references/failure-patterns.md`
+
+그 후 `verifiedFailures` 를 **className 단위로 그룹화** 하여 순차 처리:
+
+각 className 에 대해:
+1. 테스트 소스 `Read`.
+2. 에러 메시지 + stackTrace 를 failure-patterns.md 의 매핑 표와 대조.
+3. 실제 리소스 값을 `Grep` 으로 확인:
+   - Android resource id: `grep -r "R.id.xxx\|<유사이름>" <project>/src/main/res/layout/ --include="*.xml"`
+   - 문자열: `grep -r "<text>" <project>/src/main/res/values/ --include="strings*.xml"`
+   - Compose testTag: `grep -r "testTag(\"xxx\")" <project>/src/main/java <project>/src/main/kotlin`
+   - iOS accessibilityIdentifier: `grep -r "accessibilityIdentifier = \"xxx\"" <project>`
+4. **최소 수정 (minimal fix)** 을 `Edit` 으로 적용:
+   - 매처 교체, waitForExistence 추가, scrollTo() 추가 등.
+   - Assertion 제거 / 테스트 의도 변경 절대 금지.
+   - 테스트 코드를 먼저 고치고, 명백히 프러덕 버그일 때만 prod 코드 수정.
+5. **컴파일 체크** (실패하면 rollback 후 다른 수정 시도):
+   - Android:
+     ```bash
+     ./gradlew ":${MAIN_MODULE}:compile$(printf '%s\n' "${VARIANT:-Debug}" | sed 's/.*/\u&/')AndroidTestSources" 2>&1 | tee -a "$BUILD_DIR/logs/compile-check.log"
+     ```
+   - iOS:
+     ```bash
+     xcodebuild build-for-testing -workspace <ws> -scheme <scheme> -destination "id=$CURRENT_DEVICE" 2>&1 | tee -a "$BUILD_DIR/logs/compile-check.log"
+     ```
+6. 수정된 파일들을 **원자적으로 commit**:
+   ```bash
+   git add <modified files>
+   git commit -m "fix(uitest): <ClassName> - <brief root cause>"
+   ```
+   (pre-commit 훅 실패 시 우회 금지. 원인 해결 후 재시도.)
+
+**모든 className 처리 후** `$BUILD_DIR/logs/fix_report.json` 작성:
+```json
+{
+  "taskId": "",
+  "projectPath": ".",
+  "status": "completed|needs_review",
+  "filesModified": ["path/A.kt", "path/B.kt"],
+  "fixedTests": [
+    {"className":"...","testName":"...","rootCause":"...","fixApplied":"...","commitHash":"..."}
+  ]
+}
+```
+
+```bash
+MODIFIED=$(python3 -c "import json; print(len(json.load(open('$BUILD_DIR/logs/fix_report.json'))['filesModified']))")
+FIXED=$(python3 -c "import json; print(len(json.load(open('$BUILD_DIR/logs/fix_report.json'))['fixedTests']))")
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh fix-done "파일 ${MODIFIED}개 / 테스트 ${FIXED}건 수정"
+```
+
+### 6. 재테스트
+
+**재실행 범위 규칙**:
+- 사용자가 원래 `--suite`/`--method`/`--class` 를 지정했다면 → **동일 인자 그대로 재적용**.
+- 지정이 없었다면 → `fix_report.json` 에서 수정된 className 만 모아 `--class` 반복 전달.
+
+- 디바이스는 동일 `CURRENT_DEVICE` 사용.
+- 출력 디렉토리는 `$BUILD_DIR/retest/`.
+
+**반드시 단일 라인**으로 호출 (multi-line `\` 연결 금지). variant 는 1차 실행에서 결정된 값을 그대로 사용 (필요 시 `--variant <detected>` 명시).
+
+Android 예시:
+```
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/retest" --module "$MAIN_MODULE" --device "$CURRENT_DEVICE" --class com.example.FooTest
+```
+
+iOS 예시:
+```
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-ios.sh" --output-dir "$BUILD_DIR/retest" --device "$CURRENT_DEVICE" --class MyAppUITests/LoginTest
+```
+
+```bash
+RFC=$(python3 -c "import json; print(json.load(open('$BUILD_DIR/retest/all_uitest_results.json'))['failedCount'])")
+RPC=$(python3 -c "import json; print(json.load(open('$BUILD_DIR/retest/all_uitest_results.json'))['passedCount'])")
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh retest-done "통과 ${RPC} / 실패 ${RFC}"
+```
+
+재테스트에서 여전히 실패가 남아 있으면 `fix_report.json` 의 `status` 를 `needs_review` 로 업데이트하되, **사용자 결정 없이 추가 수정을 반복하지 말 것** (무한 루프 방지).
+
+### 7. (사용자 수행) Push / PR
+
+이 skill 은 PR 을 생성하지 **않는다**. 사용자가 직접 `git push` / `gh pr create` 를 실행한다.
+
+### 9. 최종 리포트
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/summary-report.py "$BUILD_DIR"
+bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh complete "리포트: $BUILD_DIR/summary.md"
+```
+
+리포트 내용을 콘솔에 출력하고 끝. 사용자에게:
+- 사용된 디바이스, 테스트 범위
+- 1차 / Verify / Fix / 재테스트 요약
+- `needs_review` 항목이 있으면 명시적으로 경고
+
+를 요약해서 보고한다.
+
+---
+
+## 중요 규칙
+
+1. **Bash 툴에 전달하는 커맨드는 반드시 단일 라인** — `\` 로 라인 이어붙이기 금지. 스크립트 실행은 모든 인자를 한 줄에 나열한다.
+2. **`${CLAUDE_SKILL_DIR}` 는 반드시 쌍따옴표로 감싸서 사용** — 경로 치환 실패 시 빈 문자열이 되지 않도록 `"${CLAUDE_SKILL_DIR}"` 로 쓰고, 치환 결과가 비어있다면 즉시 중단하고 사용자에게 보고.
+3. **테스트 범위를 지정받으면 절대 벗어나지 말 것** — 1차·verify·재테스트 모두 동일 필터.
+4. **동일 디바이스 고정 유지** — 모든 단계에서 같은 `CURRENT_DEVICE`. 기기 전환 시 반드시 사용자 승인.
+5. **알림을 빠뜨리지 말 것** — 각 단계 끝에 `notify-step.sh` 호출.
+6. **Assertion 을 지우지 말 것**, 테스트 의도를 바꾸지 말 것.
+7. **pre-commit 훅 우회(`--no-verify`) 금지** — 훅 실패 시 원인 해결.
+8. **산출물은 전부 `$BUILD_DIR` 하위** — 프로젝트 루트에 파일 생성 금지.
+9. **재수정 루프 금지** — 재테스트 실패 시 `needs_review` 로 기록하고 종료. 사용자 확인 없이 반복 수정하지 않는다.
+
+## 참조 문서
+
+- [Android UITest Conventions](references/android-uitest-conventions.md)
+- [iOS UITest Conventions](references/ios-uitest-conventions.md)
+- [Failure Patterns & Fix Strategy](references/failure-patterns.md)
+- [MCP Setup (mobile-mcp)](references/mcp-setup.md)

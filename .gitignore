@@ -12,6 +12,7 @@
 .gemini/agents/logs/*
 .gemini/agents/plans/*
 .gemini/agents/workspace/*
+.gemini/agents/state/*
 
 # ...but NOT the .gitkeep files, which preserve the directory structure.
 !/.gemini/agents/**/.gitkeep

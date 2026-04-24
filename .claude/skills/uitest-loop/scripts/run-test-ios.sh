@@ -12,7 +12,9 @@
 #   --device <udid>         고정 디바이스 UDID (시뮬레이터 or 실기기; 미지정 시 booted 시뮬레이터)
 #   --class <fqn>           테스트 클래스. "<TargetName>/<ClassName>" 형식 (반복 가능)
 #   --suite <fqn>           테스트 스위트 (xctestplan 이름 또는 XCTestSuite FQN)
-#   --method <name>         테스트 메서드 (class 와 함께 지정)
+#   --method <name>         테스트 메서드. --class 없이 단독 사용 가능 —
+#                           UITests 소스를 스캔해 XCTestCase 서브클래스에서 자동 감지.
+#                           다수 매칭 시 오류 중단 (--class 로 지명 필요).
 #   --project-path <path>   결과 메타데이터용 (default: .)
 #   --dry-run               계획만 출력
 #
@@ -75,6 +77,20 @@ fi
 if [[ -z "$WORKSPACE_FILE" && -z "$XCODEPROJ_FILE" ]]; then
   log "No .xcworkspace / .xcodeproj found under $PROJECT_PATH"
   exit 1
+fi
+
+# ─── Auto-resolve class from method (method-only case) ───────────────────
+# --method 만 주어진 경우 프로젝트 내 .swift 를 스캔해 XCTestCase 서브클래스에서
+# 해당 메서드를 가진 클래스를 자동 감지한다. 결과는 "TargetName/ClassName" 형식.
+if [[ ${#TEST_CLASSES[@]} -eq 0 && -z "$TEST_SUITE" && -n "$TEST_METHOD" ]]; then
+  log "Auto-resolving test class for method '$TEST_METHOD' under $PROJECT_PATH..."
+  RESOLVED_CLASS="$(python3 "$SCRIPT_DIR/resolve-test-class.py" --platform ios --root "$PROJECT_PATH" --method "$TEST_METHOD")"
+  RESOLVE_RC=$?
+  if [[ $RESOLVE_RC -ne 0 || -z "$RESOLVED_CLASS" ]]; then
+    exit ${RESOLVE_RC:-2}
+  fi
+  log "Auto-detected class: $RESOLVED_CLASS (method=$TEST_METHOD)"
+  TEST_CLASSES+=("$RESOLVED_CLASS")
 fi
 
 # ─── Scheme 추론 ──────────────────────────────────────────────────────────

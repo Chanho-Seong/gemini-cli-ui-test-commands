@@ -24,7 +24,7 @@ allowed-tools: Bash Read Edit Grep Glob mcp__mobile-mcp__*
 `$ARGUMENTS` 에서 다음을 파싱한다 (전부 선택):
 - `--class <FQCN>` — 실행할 테스트 클래스. 복수 지정 가능 (반복 flag).
 - `--suite <FQCN>` — 테스트 스위트 (`@RunWith(Suite.class)` / iOS test plan).
-- `--method <name>` — 특정 테스트 메서드 (반드시 `--class` 와 함께).
+- `--method <name>` — 특정 테스트 메서드. `--class` 없이 단독 사용해도 된다 — 스크립트가 `androidTest`/UITests 소스를 스캔해 해당 메서드가 속한 클래스를 자동 감지한다. 동일 이름 메서드가 여러 클래스에 존재해 모호하면 감지 실패로 중단하므로, 그 경우에만 `--class` 를 함께 지정한다.
 - `--variant <name>` — Android buildVariant (기본: `debug`).
 - `--module <name>` — Android Gradle 모듈명. 미지정 시 `settings.gradle*` 에서 `com.android.application` 적용 모듈을 자동 감지.
 - `--device <id>` — 사용할 디바이스 id (Android adb serial, iOS UDID). 미지정 시 기존 pin 재사용 또는 사용자 확인.
@@ -78,17 +78,21 @@ bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh start "PLATFORM=$PLATFORM MAIN_M
 **테스트 필터 (--class/--suite/--method) 를 정확히 전달한다.**
 **중요:** Bash 툴 호출 시 **반드시 한 줄**로 작성한다. 다중 라인 `\` 연결은 쓰지 말 것 (툴 실행 중 분해되어 실패).
 
-**Android variant 처리:** `--variant` 를 지정하지 않으면 스크립트가 `<module>/build.gradle*` 을 파싱해 `productFlavors + buildTypes` 조합을 추정하고 **debug 우선** 으로 자동 선택한다.
-사용자가 `--variant` 를 주지 않았더라도 **첫 호출에서 바로 올바른 variant** (예: `googleDebug`) 를 찾는다. 따라서 실패 → 변경 재시도 루프를 돌리지 말 것. 감지 결과가 의심스러우면 다음 명령으로 후보를 먼저 확인:
+**Android variant 처리:**
+- 사용자가 `$ARGUMENTS` 에 `--variant <name>` 을 넘긴 경우 → **반드시 그대로 `--variant "$VARIANT"` 인자로 전달**해야 한다. 누락 시 자동 감지 결과가 사용자 지정값과 달라질 수 있음.
+- `--variant` 가 없으면 스크립트가 `<module>/build.gradle*` 을 파싱해 `productFlavors + buildTypes` 조합을 추정하고 **debug 우선** 으로 자동 선택한다. 첫 호출에서 바로 올바른 variant (예: `googleDebug`) 를 찾으므로 실패 → 변경 재시도 루프를 돌리지 말 것.
+
+감지 결과가 의심스러우면 다음 명령으로 후보를 먼저 확인:
 ```
 bash "${CLAUDE_SKILL_DIR}/scripts/detect-variants.sh" --module "$MAIN_MODULE" --fast
 ```
 
-Android (예시 — 인자 순서 자유, 필요 시 반복):
+Android (예시 — 인자 순서 자유, 필요 시 반복). 사용자가 `--variant` 를 지정한 경우 반드시 포함:
 ```
-bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/logs" --module "$MAIN_MODULE" --device "$CURRENT_DEVICE" --project-path "." --class com.example.FooTest
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/logs" --module "$MAIN_MODULE" --variant "$VARIANT" --device "$CURRENT_DEVICE" --project-path "." --class com.example.FooTest
 ```
-(VARIANT 가 사용자 인자로 넘어온 경우만 `--variant "$VARIANT"` 를 추가. 안 넘어왔으면 생략 — 자동 감지.)
+`--variant` 가 `$ARGUMENTS` 에 없으면 해당 토큰만 생략한다 (자동 감지에 위임).
+이후 단계(재테스트/컴파일 체크)에서 동일 값을 재사용하려면, 1차 실행 시 스크립트 로그(`[run-test-android] Auto-detected variant: ...`)에서 확정된 값을 `VARIANT` 환경변수에 저장해 두고 사용한다.
 
 iOS:
 ```
@@ -211,11 +215,11 @@ bash ${CLAUDE_SKILL_DIR}/scripts/notify-step.sh fix-done "파일 ${MODIFIED}개 
 - 디바이스는 동일 `CURRENT_DEVICE` 사용.
 - 출력 디렉토리는 `$BUILD_DIR/retest/`.
 
-**반드시 단일 라인**으로 호출 (multi-line `\` 연결 금지). variant 는 1차 실행에서 결정된 값을 그대로 사용 (필요 시 `--variant <detected>` 명시).
+**반드시 단일 라인**으로 호출 (multi-line `\` 연결 금지). variant 는 1차 실행에서 결정된 값을 그대로 `--variant "$VARIANT"` 로 명시 전달한다 (자동 감지 결과 불일치로 인한 재빌드 방지).
 
 Android 예시:
 ```
-bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/retest" --module "$MAIN_MODULE" --device "$CURRENT_DEVICE" --class com.example.FooTest
+bash "${CLAUDE_SKILL_DIR}/scripts/run-test-android.sh" --output-dir "$BUILD_DIR/retest" --module "$MAIN_MODULE" --variant "$VARIANT" --device "$CURRENT_DEVICE" --class com.example.FooTest
 ```
 
 iOS 예시:

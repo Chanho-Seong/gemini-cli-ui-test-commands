@@ -12,7 +12,9 @@
 #   --device <id>           고정 디바이스 id (미지정 시 adb devices 전체)
 #   --class <fqn>           테스트 클래스 (반복 지정 가능)
 #   --suite <fqn>           테스트 스위트 (@RunWith(Suite.class) FQCN)
-#   --method <name>         테스트 메서드 이름 (FQCN#method 허용)
+#   --method <name>         테스트 메서드 이름. --class 없이 단독 사용 가능 —
+#                           androidTest 소스를 스캔해 메서드가 속한 클래스를 자동 감지.
+#                           동일 메서드가 여러 클래스에 있으면 오류 중단 (--class 로 지명 필요).
 #   --project-path <path>   결과 메타데이터용 (default: .)
 #   --dry-run               계획만 출력
 #
@@ -111,6 +113,20 @@ fi
 APP_APK="./${MODULE_PATH}/build/outputs/apk/${APK_SUBPATH}/${APK_BASENAME}.apk"
 TEST_APK="./${MODULE_PATH}/build/outputs/apk/androidTest/${APK_SUBPATH}/${APK_BASENAME}-androidTest.apk"
 
+# ─── Auto-resolve class from method (method-only case) ───────────────────
+# --method 만 주어지고 --class/--suite 가 없으면 androidTest 소스에서 해당 메서드를 가진
+# 클래스를 스캔해 자동 감지한다. 2개 이상 매칭되면 종료 (사용자가 --class 로 지명).
+if [[ ${#TEST_CLASSES[@]} -eq 0 && -z "$TEST_SUITE" && -n "$TEST_METHOD" ]]; then
+  log "Auto-resolving test class for method '$TEST_METHOD' under module '$MODULE'..."
+  RESOLVED_CLASS="$(python3 "$SCRIPT_DIR/resolve-test-class.py" --platform android --root "./${MODULE_PATH}" --method "$TEST_METHOD")"
+  RESOLVE_RC=$?
+  if [[ $RESOLVE_RC -ne 0 || -z "$RESOLVED_CLASS" ]]; then
+    exit ${RESOLVE_RC:-2}
+  fi
+  log "Auto-detected class: $RESOLVED_CLASS (method=$TEST_METHOD)"
+  TEST_CLASSES+=("$RESOLVED_CLASS")
+fi
+
 # ─── Test filter (class/suite/method) ─────────────────────────────────────
 INSTR_CLASS_VALUES=()
 
@@ -126,12 +142,6 @@ for c in "${TEST_CLASSES[@]:-}"; do
     INSTR_CLASS_VALUES+=("$c")
   fi
 done
-
-# class 없이 method만 지정된 경우는 허용되지 않음 (class 필요)
-if [[ ${#INSTR_CLASS_VALUES[@]} -eq 0 && -n "$TEST_METHOD" ]]; then
-  echo "--method 는 --class 또는 --suite 와 함께 지정해야 합니다" >&2
-  exit 2
-fi
 
 INSTRUMENT_CLASS_ARG=""
 if [[ ${#INSTR_CLASS_VALUES[@]} -gt 0 ]]; then
